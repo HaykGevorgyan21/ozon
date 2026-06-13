@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "WebNavigator Ozon Helper",
+  "version": "1.0.0",
+  "description": "Find and open an Ozon product by article directly from the search results page.",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": [
+    "*://*.ozon.com/*",
+    "*://*.ozon.ru/*"
+  ],
+  "action": {
+    "default_title": "Ozon Helper",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.ozon.com/*",
+        "*://*.ozon.ru/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

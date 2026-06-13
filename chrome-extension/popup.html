@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ozon Helper</title>
+  <link rel="stylesheet" href="./popup.css">
+</head>
+<body>
+  <main class="popup-shell">
+    <p class="eyebrow">WebNavigator Extension</p>
+    <h1>Ozon Helper</h1>
+    <p class="copy">
+      Откройте страницу результатов поиска Ozon, при желании укажите бренд, затем введите артикул и дайте расширению найти нужный товар в текущей вкладке.
+    </p>
+
+    <form id="find-form" class="find-form">
+      <label for="brand-input">Бренд товара</label>
+      <input
+        id="brand-input"
+        name="brand"
+        type="text"
+        placeholder="Например Apple или Xiaomi"
+        autocomplete="off"
+      >
+      <label for="article-input">Артикул товара</label>
+      <input
+        id="article-input"
+        name="article"
+        type="text"
+        placeholder="Например 4510869097"
+        autocomplete="off"
+        required
+      >
+      <label for="cycle-input">Количество циклов</label>
+      <input
+        id="cycle-input"
+        name="cycles"
+        type="number"
+        min="1"
+        step="1"
+        value="1"
+        inputmode="numeric"
+        required
+      >
+      <label for="duration-input">За какое время выполнить циклы</label>
+      <select id="duration-input" name="duration" required>
+        <option value="1800000">30 минут</option>
+        <option value="3600000">1:00</option>
+        <option value="5400000">1:30</option>
+        <option value="7200000">2:00</option>
+        <option value="9000000">2:30</option>
+        <option value="10800000">3:00</option>
+        <option value="12600000">3:30</option>
+        <option value="14400000">4:00</option>
+        <option value="16200000">4:30</option>
+        <option value="18000000">5:00</option>
+        <option value="19800000">5:30</option>
+        <option value="21600000">6:00</option>
+        <option value="23400000">6:30</option>
+        <option value="25200000">7:00</option>
+        <option value="27000000">7:30</option>
+        <option value="28800000">8:00</option>
+        <option value="30600000">8:30</option>
+        <option value="32400000">9:00</option>
+        <option value="34200000">9:30</option>
+        <option value="36000000">10:00</option>
+      </select>
+      <p id="schedule-summary" class="schedule-summary" aria-live="polite"></p>
+      <div class="actions">
+        <button id="start-button" type="submit">Запустить циклы</button>
+        <button id="stop-button" type="button" class="secondary-button">Стоп</button>
+      </div>
+    </form>
+
+    <p id="progress-message" class="progress-message" aria-live="polite"></p>
+    <p id="status-message" class="status-message" aria-live="polite">Готово к поиску.</p>
+  </main>
+
+  <script src="./popup.js"></script>
+</body>
+</html>

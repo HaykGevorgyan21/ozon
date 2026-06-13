@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebNavigator</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <main class="app-shell">
+    <section class="hero-card">
+      <p class="eyebrow">Симулятор истории браузера</p>
+      <h1>WebNavigator</h1>
+      <p class="hero-copy">
+        Откройте страницу, вернитесь назад и снова перейдите вперед. Веб-версия сохраняет ту же логику стеков, но в более простом интерфейсе.
+      </p>
+
+      <form class="visit-form" id="visit-form">
+        <label class="sr-only" for="site-input">Введите сайт</label>
+        <input
+          id="site-input"
+          name="site"
+          type="text"
+          placeholder="Например www.ozon.com"
+          autocomplete="off"
+          required
+        >
+        <label class="sr-only" for="search-input">Введите текст для поиска</label>
+        <input
+          id="search-input"
+          name="searchText"
+          type="text"
+          placeholder="Введите текст для поиска"
+          autocomplete="off"
+          required
+        >
+        <label class="sr-only" for="article-input">Введите артикул товара</label>
+        <input
+          id="article-input"
+          name="article"
+          type="text"
+          placeholder="Введите артикул товара"
+          autocomplete="off"
+          required
+        >
+        <button type="submit">Найти и открыть</button>
+
+        <div class="cycle-field">
+          <label for="cycle-count">Количество циклов</label>
+          <input
+            id="cycle-count"
+            name="cycleCount"
+            type="number"
+            min="1"
+            step="1"
+            value="1"
+            inputmode="numeric"
+          >
+        </div>
+
+        <p class="cycle-help">
+          Сначала приложение ищет товар по тексту запроса, затем находит среди результатов нужный артикул и открывает именно этот товар.
+        </p>
+      </form>
+
+      <section id="loading-panel" class="loading-panel hidden" aria-live="polite">
+        <div class="loading-head">
+          <div>
+            <p class="loading-label">Прогресс циклов</p>
+            <h2 id="loading-title" class="loading-title">Подготовка запуска</h2>
+          </div>
+          <div class="loading-counter">
+            <span id="loading-current">0</span>
+            <span class="loading-divider">/</span>
+            <span id="loading-total">0</span>
+          </div>
+        </div>
+
+        <div class="progress-track" aria-hidden="true">
+          <div id="progress-fill" class="progress-fill"></div>
+        </div>
+
+        <div class="loading-meta">
+          <p id="loading-step" class="loading-step">Ожидание запуска</p>
+          <div class="loading-dots" aria-hidden="true">
+            <span></span>
+            <span></span>
+            <span></span>
+          </div>
+        </div>
+      </section>
+
+      <div class="toolbar" aria-label="Навигация">
+        <button type="button" id="back-button" class="secondary-button">Назад</button>
+        <button type="button" id="forward-button" class="secondary-button">Вперед</button>
+        <button type="button" id="reset-button" class="ghost-button">Сброс</button>
+        <button type="button" id="open-search-button" class="secondary-button hidden">Открыть поиск здесь</button>
+      </div>
+
+      <p id="status-message" class="status-message" aria-live="polite"></p>
+    </section>
+  </main>
+
+  <script src="./app.js"></script>
+</body>
+</html>

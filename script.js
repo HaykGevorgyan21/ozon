@@ -1,5 +1,5 @@
 const Stack = require('./stack.js');
-const prompt = require('prompt-sync')();
+const prompt = require('prompt-sync')({ sigint: true });
 // ------------------------------
 // Initialization
 const backPages = new Stack();
@@ -9,13 +9,13 @@ let currentPage = 'Start Page';
 
 // ------------------------------
 // Helper Functions
-showCurrentPage = (action) => {
-        console.log(`\n${action}`);
-        console.log(`Current page = ${currentPage}`);
-        console.log('Back page = ', backPages.peek());
-        console.log('Next page = ', nextPages.peek());
-    }
-    // ------------------------------
+const showCurrentPage = (action) => {
+    console.log(`\n${action}`);
+    console.log(`Current page = ${currentPage}`);
+    console.log('Back page = ', backPages.peek());
+    console.log('Next page = ', nextPages.peek());
+};
+// ------------------------------
 
 /*
  * The following strings are used to prompt the user
@@ -28,27 +28,34 @@ const question = 'Where would you like to go today? '
 
 // ------------------------------
 // User Interface Part 1
-newPage = (page) => {
-        backPages.push(currentPage);
-        currentPage = page;
+const newPage = (page) => {
+    backPages.push(currentPage);
+    currentPage = page;
 
-        // clear the nextPages stack
-        while (!nextPages.isEmpty()) {
-            nextPages.pop();
-        }
-
-        showCurrentPage("NEW: ");
+    // clear the nextPages stack
+    while (!nextPages.isEmpty()) {
+        nextPages.pop();
     }
-    // ------------------------------
+
+    showCurrentPage('NEW: ');
+};
+// ------------------------------
 
 // ------------------------------
 // User Interface Part 2
-backPage = () => {
-        nextPages.push(currentPage);
-        currentPage = backPages.pop();
-        showCurrentPage("BACK: ");
-    }
-    // ------------------------------
+const backPage = () => {
+    nextPages.push(currentPage);
+    currentPage = backPages.pop();
+    showCurrentPage('BACK: ');
+};
+// ------------------------------
+
+const nextPage = () => {
+    backPages.push(currentPage);
+    currentPage = nextPages.pop();
+    showCurrentPage('FORWARD: ');
+};
+// ------------------------------
 
 let finish = false;
 let showBack = false;
@@ -74,8 +81,12 @@ while (finish === false) {
     instructions = `${instructions}, ${quitInfo}.`;
     console.log(instructions);
 
-    const response = prompt('How are you today?');
     const answer = prompt(question);
+    if (answer === null) {
+        finish = true;
+        continue;
+    }
+
     const lowerCaseAnswer = answer.toLowerCase();
     if ((lowerCaseAnswer !== 'n') && (lowerCaseAnswer !== 'b') && (lowerCaseAnswer !== 'q')) {
         // we create a new page based on the url
