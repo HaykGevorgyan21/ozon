@@ -1,17 +1,24 @@
 const form = document.querySelector("#find-form");
 const brandInput = document.querySelector("#brand-input");
+const searchTermList = document.querySelector("#search-term-list");
+const addSearchTermButton = document.querySelector("#add-search-term-button");
 const articleInput = document.querySelector("#article-input");
 const cycleInput = document.querySelector("#cycle-input");
-const durationInput = document.querySelector("#duration-input");
-const scheduleSummary = document.querySelector("#schedule-summary");
 const statusMessage = document.querySelector("#status-message");
 const progressMessage = document.querySelector("#progress-message");
+const metricsMessage = document.querySelector("#metrics-message");
 const startButton = document.querySelector("#start-button");
 const stopButton = document.querySelector("#stop-button");
+const nextProxyButton = document.querySelector("#next-proxy-button");
+const disableProxyButton = document.querySelector("#disable-proxy-button");
+const proxyMessage = document.querySelector("#proxy-message");
 
 let statusPollTimer = null;
 let statusLockUntil = 0;
-const DEFAULT_DURATION_MS = 30 * 60 * 1000;
+let proxyConfigured = false;
+let runIsActive = false;
+
+const getSearchTermInputs = () => Array.from(document.querySelectorAll(".search-term-input"));
 
 const setStatus = (message) => {
   statusMessage.textContent = message;
@@ -21,17 +28,113 @@ const setProgress = (message = "") => {
   progressMessage.textContent = message;
 };
 
-const setScheduleSummary = (message = "") => {
-  scheduleSummary.textContent = message;
+const setMetrics = (message = "") => {
+  metricsMessage.textContent = message;
 };
 
+const setProxyMessage = (message = "") => {
+  proxyMessage.textContent = message;
+};
+
+const formatMetricDuration = (durationMs = 0) => {
+  const safeValue = Math.max(0, Number.parseInt(String(durationMs || 0), 10) || 0);
+
+  if (safeValue < 1000) {
+    return `${safeValue} мс`;
+  }
+
+  return `${(safeValue / 1000).toFixed(1)} сек`;
+};
+
+const buildMetricsSummary = (result) => {
+  const metrics = result?.metrics;
+
+  if (!metrics) {
+    return "";
+  }
+
+  const completedCycles = Math.max(0, Number.parseInt(String(result?.completedCycles || 0), 10) || 0);
+  const productVisits = Math.max(0, Number.parseInt(String(metrics.productVisits || 0), 10) || 0);
+  const productOpenSignals = Math.max(0, Number.parseInt(String(metrics.productOpenSignals || 0), 10) || 0);
+  const backNavigations = Math.max(0, Number.parseInt(String(metrics.backNavigations || 0), 10) || 0);
+  const searchSubmissions = Math.max(0, Number.parseInt(String(metrics.searchSubmissions || 0), 10) || 0);
+  const proxyRotations = Math.max(0, Number.parseInt(String(metrics.proxyRotations || 0), 10) || 0);
+  const proxyRecoveries = Math.max(0, Number.parseInt(String(metrics.proxyRecoveries || 0), 10) || 0);
+  const proxyFallbackCycles = Math.max(0, Number.parseInt(String(metrics.proxyFallbackCycles || 0), 10) || 0);
+  const failedCycles = Math.max(0, Number.parseInt(String(metrics.failedCycles || 0), 10) || 0);
+  const totalProductHoldMs = Math.max(0, Number.parseInt(String(metrics.totalProductHoldMs || 0), 10) || 0);
+  const averageHoldMs = productVisits ? Math.round(totalProductHoldMs / productVisits) : 0;
+
+  return [
+    `Метрики: открытий товара ${productOpenSignals}, визитов ${productVisits}, возвратов ${backNavigations}.`,
+    `Поисков ${searchSubmissions}, proxy rotations ${proxyRotations}.`,
+    `Proxy recoveries ${proxyRecoveries}, fallback cycles ${proxyFallbackCycles}, failed cycles ${failedCycles}.`,
+    `Среднее время на товаре ${formatMetricDuration(averageHoldMs)}, завершено циклов ${completedCycles}.`,
+  ].join(" ");
+};
+
+const createSearchTermRow = (value = "") => {
+  const row = document.createElement("div");
+  row.className = "search-term-row";
+
+  const input = document.createElement("input");
+  input.type = "text";
+  input.autocomplete = "off";
+  input.placeholder = "Еще одно название товара";
+  input.className = "search-term-input";
+  input.value = value;
+
+  const removeButton = document.createElement("button");
+  removeButton.type = "button";
+  removeButton.className = "secondary-button search-term-remove-button";
+  removeButton.textContent = "-";
+  removeButton.setAttribute("aria-label", "Удалить это название товара");
+  removeButton.addEventListener("click", () => {
+    row.remove();
+  });
+
+  row.append(input, removeButton);
+  return row;
+};
+
+const clearExtraSearchTermRows = () => {
+  Array.from(searchTermList.querySelectorAll(".search-term-row")).slice(1).forEach((row) => {
+    row.remove();
+  });
+};
+
+const setSearchTerms = (values = []) => {
+  const normalizedValues = Array.isArray(values)
+    ? values.map((value) => String(value || "").trim())
+    : [];
+  const [firstValue = "", ...restValues] = normalizedValues;
+
+  brandInput.value = firstValue;
+  clearExtraSearchTermRows();
+  restValues.forEach((value) => {
+    searchTermList.append(createSearchTermRow(value));
+  });
+};
+
+const getSearchTerms = () => getSearchTermInputs()
+  .map((input) => String(input.value || "").trim())
+  .filter(Boolean);
+
 const setControls = ({ running }) => {
+  runIsActive = running;
   startButton.disabled = running;
   stopButton.disabled = !running;
-  brandInput.disabled = running;
+  getSearchTermInputs().forEach((input) => {
+    input.disabled = running;
+  });
+  addSearchTermButton.disabled = running;
+  Array.from(document.querySelectorAll(".search-term-remove-button")).forEach((button) => {
+    button.disabled = running;
+  });
   articleInput.disabled = running;
   cycleInput.disabled = running;
-  durationInput.disabled = running;
+  nextProxyButton.disabled = running || !proxyConfigured;
+  disableProxyButton.disabled = running;
 };
 
 const getCycleCount = () => {
@@ -44,61 +147,25 @@ const getCycleCount = () => {
   return parsedValue;
 };
 
-const getDurationMs = () => {
-  const parsedValue = Number.parseInt(durationInput.value, 10);
-
-  if (Number.isNaN(parsedValue) || parsedValue < 1) {
-    return DEFAULT_DURATION_MS;
-  }
-
-  return parsedValue;
-};
-
-const formatNumber = (value) => {
-  if (!Number.isFinite(value)) {
-    return "0";
-  }
-
-  return new Intl.NumberFormat("ru-RU", {
-    maximumFractionDigits: value < 10 ? 1 : 0,
-  }).format(value);
-};
-
-const formatDuration = (durationMs) => {
-  if (durationMs < 1000) {
-    return `${formatNumber(durationMs)} мс`;
-  }
-
-  const totalSeconds = durationMs / 1000;
-
-  if (totalSeconds < 60) {
-    return `${formatNumber(totalSeconds)} сек`;
-  }
-
-  const totalMinutes = durationMs / (60 * 1000);
-
-  if (totalMinutes < 60) {
-    return `${formatNumber(totalMinutes)} мин`;
-  }
-
-  const totalHours = durationMs / (60 * 60 * 1000);
-  return `${formatNumber(totalHours)} ч`;
-};
-
-const renderScheduleSummary = () => {
-  const cycles = getCycleCount();
-  const durationMs = getDurationMs();
-  const intervalMs = durationMs / cycles;
-
-  setScheduleSummary(`${cycles} цикл(ов) за ${formatDuration(durationMs)}: 1 цикл каждые ${formatDuration(intervalMs)}.`);
-};
-
 const sendRuntimeMessage = (payload) => chrome.runtime.sendMessage(payload);
 
-const loadLastValues = async () => {
-  const result = await chrome.storage.local.get(["lastBrand", "lastArticle", "lastCycleCount", "lastDurationMs"]);
+const getProxyStatus = async () => sendRuntimeMessage({ type: "GET_OZON_PROXY_STATUS" });
 
-  if (result.lastBrand) {
+const rotateProxy = async () => sendRuntimeMessage({ type: "ROTATE_OZON_PROXY" });
+
+const clearProxy = async () => sendRuntimeMessage({ type: "CLEAR_OZON_PROXY" });
+
+const loadLastValues = async () => {
+  const result = await chrome.storage.local.get([
+    "lastBrand",
+    "lastSearchTerms",
+    "lastArticle",
+    "lastCycleCount",
+  ]);
+
+  if (Array.isArray(result.lastSearchTerms) && result.lastSearchTerms.length) {
+    setSearchTerms(result.lastSearchTerms);
+  } else if (result.lastBrand) {
     brandInput.value = result.lastBrand;
   }
 
@@ -109,12 +176,6 @@ const loadLastValues = async () => {
   if (result.lastCycleCount) {
     cycleInput.value = String(result.lastCycleCount);
   }
-
-  if (result.lastDurationMs) {
-    durationInput.value = String(result.lastDurationMs);
-  }
-
-  renderScheduleSummary();
 };
 
 const renderStatus = (result) => {
@@ -123,6 +184,7 @@ const renderStatus = (result) => {
   if (!result?.ok) {
     setControls({ running: false });
     setProgress("");
+    setMetrics("");
     if (!isStatusLocked) {
       setStatus(result?.error || result?.message || "Не удалось получить статус.");
     }
@@ -133,12 +195,10 @@ const renderStatus = (result) => {
     statusLockUntil = 0;
     setControls({ running: true });
     setProgress(`Прогресс: ${result.completedCycles || 0} / ${result.cycles || 0}`);
+    setMetrics(buildMetricsSummary(result));
     setStatus(result.step || result.message || "Циклы выполняются...");
-    if (result.durationMs && result.cycles) {
-      const intervalMs = (result.cycleIntervalMs || result.durationMs / result.cycles);
-      setScheduleSummary(
-        `${result.cycles} цикл(ов) за ${formatDuration(result.durationMs)}: 1 цикл каждые ${formatDuration(intervalMs)}.`,
-      );
+    if (result.proxyCycleMessage) {
+      setProxyMessage(result.proxyCycleMessage);
     }
     return;
   }
@@ -151,14 +211,39 @@ const renderStatus = (result) => {
     setProgress("");
   }
 
+  setMetrics(buildMetricsSummary(result));
+
   if (!isStatusLocked) {
     setStatus(result.message || "Готово к запуску.");
   }
+
+  if (result.proxyCycleMessage) {
+    setProxyMessage(result.proxyCycleMessage);
+  }
+};
+
+const renderProxyStatus = (result) => {
+  if (!result?.ok) {
+    proxyConfigured = false;
+    nextProxyButton.disabled = true;
+    setProxyMessage(result?.message || "Не удалось получить статус proxy.");
+    return;
+  }
+
+  proxyConfigured = Boolean(result.hasProxies);
+  nextProxyButton.disabled = runIsActive || !proxyConfigured;
+  disableProxyButton.disabled = runIsActive;
+  setProxyMessage(result.message || "Proxy не задан.");
 };
 
 const refreshStatus = async () => {
   const result = await sendRuntimeMessage({ type: "GET_OZON_RUN_STATUS" });
   renderStatus(result);
+};
+
+const refreshProxyStatus = async () => {
+  const result = await getProxyStatus();
+  renderProxyStatus(result);
 };
 
 const lockStatusTemporarily = (message, durationMs = 6000) => {
@@ -175,18 +260,20 @@ const startStatusPolling = () => {
     refreshStatus().catch((error) => {
       setControls({ running: false });
       setProgress("");
+      setMetrics("");
       setStatus(error.message || "Не удалось обновить статус.");
     });
   }, 1000);
 };
 
-const startCycles = async (brand, article, cycles, durationMs) => {
+const startCycles = async (searchTerms, article, cycles) => {
   return sendRuntimeMessage({
     type: "START_OZON_CYCLES",
-    brand,
+    brand: Array.isArray(searchTerms) ? String(searchTerms[0] || "").trim() : "",
+    searchTerms,
+    brandFilter: "",
     article,
     cycles,
-    durationMs,
   });
 };
 
@@ -196,12 +283,17 @@ const stopCycles = async () => {
   });
 };
 
+addSearchTermButton.addEventListener("click", () => {
+  searchTermList.append(createSearchTermRow(""));
+  const inputs = getSearchTermInputs();
+  inputs.at(-1)?.focus();
+});
+
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
-  const brand = brandInput.value.trim();
+  const searchTerms = getSearchTerms();
   const article = articleInput.value.trim();
   const cycles = getCycleCount();
-  const durationMs = getDurationMs();
 
   if (!article) {
     setStatus("Сначала введите артикул.");
@@ -210,18 +302,18 @@ form.addEventListener("submit", async (event) => {
 
   setControls({ running: true });
   setProgress(`Прогресс: 0 / ${cycles}`);
-  setStatus(`Запускаю ${cycles} цикл(ов) для артикула ${article} на ${formatDuration(durationMs)}...`);
-  renderScheduleSummary();
+  setMetrics("");
+  setStatus(`Запускаю поиск и открытие товара: цикл 1 из ${cycles}.`);
 
   try {
     await chrome.storage.local.set({
-      lastBrand: brand,
+      lastBrand: searchTerms[0] || "",
+      lastSearchTerms: searchTerms,
       lastArticle: article,
       lastCycleCount: cycles,
-      lastDurationMs: durationMs,
     });
 
-    const result = await startCycles(brand, article, cycles, durationMs);
+    const result = await startCycles(searchTerms, article, cycles);
 
     if (!result?.ok) {
       throw new Error(result?.error || "Не удалось запустить циклы.");
@@ -233,6 +325,7 @@ form.addEventListener("submit", async (event) => {
   } catch (error) {
     setControls({ running: false });
     setProgress("");
+    setMetrics("");
     lockStatusTemporarily(error.message || "Не удалось запустить циклы.");
   }
 });
@@ -248,12 +341,48 @@ stopButton.addEventListener("click", async () => {
   }
 });
 
-cycleInput.addEventListener("input", renderScheduleSummary);
+nextProxyButton.addEventListener("click", async () => {
+  setProxyMessage("Переключаю proxy...");
+  nextProxyButton.disabled = true;
+
+  try {
+    const result = await rotateProxy();
+
+    if (!result?.ok) {
+      throw new Error(result?.message || "Не удалось переключить proxy.");
+    }
+
+    renderProxyStatus(result);
+  } catch (error) {
+    proxyConfigured = false;
+    nextProxyButton.disabled = true;
+    setProxyMessage(error.message || "Не удалось переключить proxy.");
+  }
+});
+
+disableProxyButton.addEventListener("click", async () => {
+  setProxyMessage("Отключаю proxy...");
+  nextProxyButton.disabled = true;
+  disableProxyButton.disabled = true;
+
+  try {
+    const result = await clearProxy();
+
+    if (!result?.ok) {
+      throw new Error(result?.message || "Не удалось отключить proxy.");
+    }
+
+    renderProxyStatus(result);
+  } catch (error) {
+    disableProxyButton.disabled = runIsActive;
+    nextProxyButton.disabled = runIsActive || !proxyConfigured;
+    setProxyMessage(error.message || "Не удалось отключить proxy.");
+  }
+});
+
 cycleInput.addEventListener("change", () => {
   cycleInput.value = String(getCycleCount());
-  renderScheduleSummary();
 });
-durationInput.addEventListener("change", renderScheduleSummary);
 
 window.addEventListener("beforeunload", () => {
   if (statusPollTimer) {
@@ -263,11 +392,18 @@ window.addEventListener("beforeunload", () => {
 
 Promise.all([loadLastValues(), refreshStatus()])
   .then(() => {
+    return refreshProxyStatus();
+  })
+  .then(() => {
     startStatusPolling();
   })
   .catch((error) => {
     setControls({ running: false });
     setProgress("");
+    setMetrics("");
     lockStatusTemporarily(error.message || "Готово к поиску.");
+    refreshProxyStatus().catch(() => {
+      setProxyMessage("Proxy не задан. Расширение работает без proxy.");
+    });
     startStatusPolling();
   });

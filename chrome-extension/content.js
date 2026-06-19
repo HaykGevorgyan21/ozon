@@ -7,6 +7,16 @@ const SEARCH_INPUT_SELECTORS = [
   'input[placeholder*="искать" i]',
   'input[aria-label*="поиск" i]',
 ];
+const BRAND_FILTER_INPUT_SELECTORS = [
+  'input[placeholder*="найти" i]',
+  'input[aria-label*="найти" i]',
+  'input[placeholder*="бренд" i]',
+  'input[aria-label*="бренд" i]',
+];
+const BRAND_SECTION_TEXTS = ["бренды", "бренд"];
+const SEARCH_RESULTS_READY_TIMEOUT_MS = 4500;
+const BRAND_FILTER_READY_TIMEOUT_MS = 3500;
+const MATCH_RETRY_TIMEOUT_MS = 5000;
 const LOGIN_PAGE_PATH_PATTERNS = [
   /\/login/i,
   /\/signin/i,
@@ -100,6 +110,29 @@ const CONNECTION_ERROR_TEXTS = [
 
 let isProcessingRun = false;
 let lastActionSignature = "";
+let lastAppliedBrandFilterKey = "";
+const APPLIED_BRAND_FILTER_STORAGE_KEY = "ozon_helper_applied_brand_filter_key";
+
+const getStoredAppliedBrandFilterKey = () => {
+  try {
+    return String(window.sessionStorage.getItem(APPLIED_BRAND_FILTER_STORAGE_KEY) || "");
+  } catch (error) {
+    return "";
+  }
+};
+
+const setStoredAppliedBrandFilterKey = (key) => {
+  try {
+    if (key) {
+      window.sessionStorage.setItem(APPLIED_BRAND_FILTER_STORAGE_KEY, key);
+      return;
+    }
+
+    window.sessionStorage.removeItem(APPLIED_BRAND_FILTER_STORAGE_KEY);
+  } catch (error) {
+    // Ignore storage issues and keep runtime state only.
+  }
+};
 
 const normalizeText = (value) => String(value || "").replace(/\s+/g, " ").trim();
 
@@ -122,6 +155,21 @@ const isOzonConnectionErrorPage = () => {
   }
 
   return CONNECTION_ERROR_TEXTS.filter((text) => bodyText.includes(text)).length >= 2;
+};
+
+const isPrivacyInterstitialPage = () => {
+  const bodyText = normalizeText(document.body?.innerText || "").toLowerCase();
+
+  if (!bodyText) {
+    return false;
+  }
+
+  return (
+    bodyText.includes("подключение не защищено")
+    || bodyText.includes("ошибка нарушения конфиденциальности")
+    || bodyText.includes("net::err_cert_")
+    || bodyText.includes("net::err_ssl_")
+  );
 };
 
 const getPageType = () => {
@@ -1457,6 +1505,20 @@ const getCurrentSearchText = () => {
   return normalizeText(input?.value || "");
 };
 
+const setInputTextValue = (input, term) => {
+  const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+
+  input.focus();
+  nativeInputValueSetter?.call(input, term);
+
+  if (input.value !== term) {
+    input.value = term;
+  }
+
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  input.dispatchEvent(new Event("change", { bubbles: true }));
+};
+
 const submitSearchTerm = async (term) => {
   const input = getSearchInput();
 
@@ -1464,15 +1526,7 @@ const submitSearchTerm = async (term) => {
     throw new Error("Не удалось найти строку поиска Ozon.");
   }
 
-  const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
-
-  input.focus();
-  nativeInputValueSetter?.call(input, term);
-  if (input.value !== term) {
-    input.value = term;
-  }
-  input.dispatchEvent(new Event("input", { bubbles: true }));
-  input.dispatchEvent(new Event("change", { bubbles: true }));
+  setInputTextValue(input, term);
 
   const form = input.closest("form");
 
@@ -1498,7 +1552,633 @@ const submitSearchTerm = async (term) => {
   }));
 };
 
+const isVisibleElement = (element) => {
+  if (!(element instanceof HTMLElement)) {
+    return false;
+  }
+
+  const rect = element.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+};
+
+const getBrandSectionRoots = () => {
+  const roots = [];
+  const headings = Array.from(document.querySelectorAll("h1, h2, h3, h4, h5, label, span, div, p, strong"));
+
+  const pushRoot = (candidate) => {
+    if (!(candidate instanceof HTMLElement)) {
+      return;
+    }
+
+    const duplicate = roots.some((root) => root === candidate);
+
+    if (!duplicate) {
+      roots.push(candidate);
+    }
+  };
+
+  for (const heading of headings) {
+    if (!isVisibleElement(heading)) {
+      continue;
+    }
+
+    const text = normalizeText(heading.textContent || "").toLowerCase();
+
+    if (!BRAND_SECTION_TEXTS.includes(text)) {
+      continue;
+    }
+
+    let current = heading;
+    let depth = 0;
+
+    while (current instanceof HTMLElement && depth < 6) {
+      const hasBrandInput = current.querySelector(BRAND_FILTER_INPUT_SELECTORS.join(", ")) instanceof HTMLInputElement;
+      const hasBrandOptions = current.querySelector('input[type="checkbox"], input[type="radio"], [role="checkbox"]') instanceof HTMLElement;
+
+      if (hasBrandInput || hasBrandOptions) {
+        pushRoot(current);
+      }
+
+      current = current.parentElement;
+      depth += 1;
+    }
+  }
+
+  if (!roots.length) {
+    const fallbackInputs = Array.from(document.querySelectorAll(BRAND_FILTER_INPUT_SELECTORS.join(", ")));
+
+    for (const input of fallbackInputs) {
+      if (!(input instanceof HTMLInputElement) || !isVisibleElement(input)) {
+        continue;
+      }
+
+      let current = input.parentElement;
+      let depth = 0;
+
+      while (current instanceof HTMLElement && depth < 6) {
+        const hasBrandOptions = current.querySelector('input[type="checkbox"], input[type="radio"], [role="checkbox"]') instanceof HTMLElement;
+
+        if (hasBrandOptions) {
+          pushRoot(current);
+          break;
+        }
+
+        current = current.parentElement;
+        depth += 1;
+      }
+    }
+  }
+
+  return roots;
+};
+
+const getBrandVerificationState = (roots, brand) => {
+  for (const root of roots) {
+    const option = findBrandOption(root, brand);
+
+    if (!option) {
+      continue;
+    }
+
+    return {
+      root,
+      option,
+      selected: isBrandOptionSelected(option),
+    };
+  }
+
+  return {
+    root: null,
+    option: null,
+    selected: false,
+  };
+};
+
+const getBrandOptionTarget = (candidate) => {
+  if (!(candidate instanceof HTMLElement)) {
+    return null;
+  }
+
+  if (candidate instanceof HTMLInputElement && (candidate.type === "checkbox" || candidate.type === "radio")) {
+    return candidate.closest("label") || candidate;
+  }
+
+  const preciseTarget = candidate.closest('label, [role="checkbox"], [role="radio"], button, a');
+
+  if (preciseTarget instanceof HTMLElement) {
+    return preciseTarget;
+  }
+
+  return candidate;
+};
+
+const getBrandToggleCandidates = (option) => {
+  if (!(option instanceof HTMLElement)) {
+    return [];
+  }
+
+  const candidates = [];
+
+  const pushCandidate = (candidate) => {
+    if (!(candidate instanceof HTMLElement) || !isVisibleElement(candidate)) {
+      return;
+    }
+
+    if (!candidates.includes(candidate)) {
+      candidates.push(candidate);
+    }
+  };
+
+  pushCandidate(option.querySelector('input[type="checkbox"], input[type="radio"]'));
+  pushCandidate(option.closest('label, [role="checkbox"], [role="button"], button'));
+  pushCandidate(option.querySelector('label, [role="checkbox"], [role="button"], button'));
+
+  for (const candidate of getActionTargetCandidates(option)) {
+    pushCandidate(candidate);
+  }
+
+  pushCandidate(option);
+
+  return candidates;
+};
+
+const getScrollableContainers = (root) => {
+  const containers = [];
+  let current = root instanceof HTMLElement ? root : null;
+  let depth = 0;
+
+  while (current instanceof HTMLElement && depth < 6) {
+    if (current.scrollHeight > current.clientHeight + 20) {
+      containers.push(current);
+    }
+
+    current = current.parentElement;
+    depth += 1;
+  }
+
+  return containers;
+};
+
+const getBrandFilterInput = (root) => {
+  if (!(root instanceof HTMLElement)) {
+    return null;
+  }
+
+  const inputs = Array.from(root.querySelectorAll(BRAND_FILTER_INPUT_SELECTORS.join(", ")));
+
+  for (const input of inputs) {
+    if (input instanceof HTMLInputElement && isVisibleElement(input)) {
+      return input;
+    }
+  }
+
+  return null;
+};
+
+const normalizeBrandIdentity = (value) => normalizeText(value || "")
+  .toLowerCase()
+  .replace(/^бренд:\s*/i, "")
+  .replace(/\s+/g, " ")
+  .trim();
+
+const getSelectedBrandChipEntries = () => {
+  const entries = [];
+  const candidates = Array.from(document.querySelectorAll("a, button, [role=\"button\"], span, div"));
+
+  for (const candidate of candidates) {
+    if (!(candidate instanceof HTMLElement) || !isVisibleElement(candidate)) {
+      continue;
+    }
+
+    const text = normalizeText(candidate.innerText || candidate.textContent || "");
+
+    if (!text || !/^бренд:\s*/i.test(text)) {
+      continue;
+    }
+
+    const normalizedBrand = normalizeBrandIdentity(text);
+
+    if (!normalizedBrand) {
+      continue;
+    }
+
+    const target = getInteractiveAncestor(candidate.closest("a, button, [role=\"button\"]") || candidate);
+
+    if (!(target instanceof HTMLElement)) {
+      continue;
+    }
+
+    if (!entries.some((entry) => entry.element === target && entry.brand === normalizedBrand)) {
+      entries.push({
+        brand: normalizedBrand,
+        element: target,
+      });
+    }
+  }
+
+  return entries;
+};
+
+const clearUnexpectedSelectedBrands = async (targetBrand) => {
+  const normalizedTargetBrand = normalizeBrandIdentity(targetBrand);
+  const selectedBrandEntries = getSelectedBrandChipEntries();
+
+  if (!selectedBrandEntries.length) {
+    return false;
+  }
+
+  const selectedBrands = selectedBrandEntries.map((entry) => entry.brand);
+  const hasOnlyTargetBrand = selectedBrands.length === 1 && selectedBrands[0] === normalizedTargetBrand;
+
+  if (hasOnlyTargetBrand) {
+    return false;
+  }
+
+  const clearAllAction = getExactActionByText(["очистить всё", "очистить все"]);
+  const previousListingSnapshot = getListingSnapshot();
+
+  if (clearAllAction) {
+    await scrollToAndClick(clearAllAction);
+  } else {
+    for (const entry of selectedBrandEntries) {
+      await scrollToAndClick(entry.element);
+      await delay(160);
+    }
+  }
+
+  await waitForSearchResultsReady({
+    previousSnapshot: previousListingSnapshot,
+    timeoutMs: BRAND_FILTER_READY_TIMEOUT_MS,
+  }).catch(() => {});
+
+  return true;
+};
+
+const isBrandOptionSelected = (element) => {
+  let current = element;
+  let depth = 0;
+
+  while (current instanceof HTMLElement && depth < 6) {
+    const ariaChecked = normalizeText(current.getAttribute("aria-checked") || "").toLowerCase();
+    const ariaPressed = normalizeText(current.getAttribute("aria-pressed") || "").toLowerCase();
+    const className = normalizeText(current.className || "").toLowerCase();
+    const checkedInput = current.querySelector('input[type="checkbox"]:checked, input[type="radio"]:checked');
+
+    if (ariaChecked === "true" || ariaPressed === "true" || checkedInput) {
+      return true;
+    }
+
+    if (
+      className.includes("selected")
+      || className.includes("checked")
+      || className.includes("active")
+      || className.includes("current")
+    ) {
+      return true;
+    }
+
+    current = current.parentElement;
+    depth += 1;
+  }
+
+  return false;
+};
+
+const findBrandOption = (root, brand) => {
+  if (!(root instanceof HTMLElement) || !brand) {
+    return null;
+  }
+
+  const normalizedBrand = normalizeText(brand).toLowerCase();
+  const preferredSelectors = [
+    "label",
+    "[role=\"checkbox\"]",
+    "[role=\"radio\"]",
+    "input[type=\"checkbox\"]",
+    "input[type=\"radio\"]",
+    "button",
+    "a",
+  ];
+  const candidates = Array.from(root.querySelectorAll(preferredSelectors.join(", ")));
+  let bestMatch = null;
+  let bestScore = -Infinity;
+
+  for (const candidate of candidates) {
+    if (!(candidate instanceof HTMLElement) || !isVisibleElement(candidate)) {
+      continue;
+    }
+
+    const target = getBrandOptionTarget(candidate);
+
+    if (!(target instanceof HTMLElement) || !isVisibleElement(target)) {
+      continue;
+    }
+
+    const text = normalizeText(target.innerText || target.textContent || "").toLowerCase();
+    const normalizedCandidateBrand = normalizeBrandIdentity(text);
+    const containsCheckbox = target.querySelector('input[type="checkbox"], input[type="radio"]');
+    const isStructuredOption = target.tagName.toLowerCase() === "label"
+      || target.getAttribute("role") === "checkbox"
+      || target.getAttribute("role") === "radio"
+      || Boolean(containsCheckbox);
+
+    if (!text || !normalizedCandidateBrand.includes(normalizedBrand)) {
+      continue;
+    }
+
+    if (text.length > Math.max(normalizedBrand.length * 4, normalizedBrand.length + 40)) {
+      continue;
+    }
+
+    let score = 0;
+
+    if (normalizedCandidateBrand === normalizedBrand) {
+      score += 180;
+    } else if (
+      normalizedCandidateBrand.startsWith(`${normalizedBrand} `)
+      || normalizedCandidateBrand.endsWith(` ${normalizedBrand}`)
+    ) {
+      score += 120;
+    } else if (new RegExp(`\\b${normalizedBrand.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(normalizedCandidateBrand)) {
+      score += 90;
+    } else {
+      score += 20;
+    }
+
+    score -= Math.abs(normalizedCandidateBrand.length - normalizedBrand.length);
+
+    if (!isStructuredOption) {
+      score -= 200;
+    }
+
+    if (containsCheckbox) {
+      score += 25;
+    }
+
+    if (target.getAttribute("role") === "checkbox" || target.getAttribute("role") === "radio") {
+      score += 20;
+    }
+
+    if (target instanceof HTMLElement && score > bestScore) {
+      bestMatch = target;
+      bestScore = score;
+    }
+  }
+
+  return bestMatch;
+};
+
+const findBrandOptionWithScroll = async (root, brand) => {
+  const immediateMatch = findBrandOption(root, brand);
+
+  if (immediateMatch) {
+    return immediateMatch;
+  }
+
+  const scrollContainers = getScrollableContainers(root);
+
+  for (const container of scrollContainers) {
+    const maxScrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
+    const step = Math.max(220, Math.floor(container.clientHeight * 0.75));
+    let scrollTop = 0;
+
+    while (scrollTop <= maxScrollTop) {
+      container.scrollTop = scrollTop;
+      await delay(120);
+
+      const scrolledMatch = findBrandOption(root, brand);
+
+      if (scrolledMatch) {
+        return scrolledMatch;
+      }
+
+      if (scrollTop === maxScrollTop) {
+        break;
+      }
+
+      scrollTop = Math.min(maxScrollTop, scrollTop + step);
+    }
+
+    container.scrollTop = 0;
+    await delay(120);
+  }
+
+  return null;
+};
+
+const ensureBrandFilterApplied = async (brand) => {
+  const normalizedBrand = normalizeText(brand).toLowerCase();
+
+  if (!normalizedBrand) {
+    return false;
+  }
+
+  await clearUnexpectedSelectedBrands(brand);
+
+  let roots = getBrandSectionRoots();
+  let verificationState = getBrandVerificationState(roots, normalizedBrand);
+
+  if (verificationState.selected) {
+    return false;
+  }
+
+  const listingSnapshotBeforeBrand = getListingSnapshot();
+  const filterInputs = roots
+    .map((root) => getBrandFilterInput(root))
+    .filter((input, index, inputs) => input instanceof HTMLInputElement && inputs.indexOf(input) === index);
+
+  for (const filterInput of filterInputs) {
+    if (normalizeText(filterInput.value || "").toLowerCase() === normalizedBrand) {
+      continue;
+    }
+
+    setInputTextValue(filterInput, brand);
+    await waitForCondition(() => {
+      roots = getBrandSectionRoots();
+      verificationState = getBrandVerificationState(roots, normalizedBrand);
+      return verificationState.option || normalizeText(filterInput.value || "").toLowerCase() === normalizedBrand;
+    }, BRAND_FILTER_READY_TIMEOUT_MS, 150);
+  }
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    roots = getBrandSectionRoots();
+    verificationState = getBrandVerificationState(roots, normalizedBrand);
+
+    if (verificationState.selected) {
+      return false;
+    }
+
+    if (!verificationState.option) {
+      for (const root of roots) {
+        const scrolledOption = await findBrandOptionWithScroll(root, normalizedBrand);
+
+        if (scrolledOption) {
+          verificationState = {
+            root,
+            option: scrolledOption,
+            selected: isBrandOptionSelected(scrolledOption),
+          };
+          break;
+        }
+      }
+    }
+
+    if (!verificationState.option) {
+      await delay(200);
+      continue;
+    }
+
+    const toggleCandidates = getBrandToggleCandidates(verificationState.option);
+
+    for (const toggleCandidate of toggleCandidates) {
+      await scrollToAndClick(toggleCandidate);
+
+      let selectedOption = await waitForCondition(() => {
+        roots = getBrandSectionRoots();
+        verificationState = getBrandVerificationState(roots, normalizedBrand);
+        return verificationState.selected ? verificationState.option : null;
+      }, 1100, 160);
+
+      if (!selectedOption) {
+        activateElementWithKeyboard(toggleCandidate);
+        selectedOption = await waitForCondition(() => {
+          roots = getBrandSectionRoots();
+          verificationState = getBrandVerificationState(roots, normalizedBrand);
+          return verificationState.selected ? verificationState.option : null;
+        }, 1100, 160);
+      }
+
+      if (selectedOption) {
+        await waitForSearchResultsReady({
+          previousSnapshot: listingSnapshotBeforeBrand,
+          timeoutMs: BRAND_FILTER_READY_TIMEOUT_MS,
+        }).catch(() => {});
+        return true;
+      }
+    }
+  }
+
+  throw new Error(`Не удалось выбрать бренд "${brand}" в фильтрах Ozon.`);
+};
+
 const canSearchForArticle = () => getSearchInput() !== null;
+
+const getVisibleProductLinks = () => Array.from(document.querySelectorAll(PRODUCT_LINK_SELECTOR))
+  .filter((link) => link instanceof HTMLAnchorElement && isVisibleElement(link));
+
+const resetResultsViewport = async () => {
+  window.scrollTo({
+    top: 0,
+    left: 0,
+    behavior: "auto",
+  });
+
+  const searchInput = getSearchInput();
+
+  if (searchInput instanceof HTMLElement) {
+    searchInput.scrollIntoView({
+      block: "start",
+      inline: "nearest",
+    });
+  }
+
+  await delay(220);
+};
+
+const getListingSnapshot = () => getVisibleProductLinks()
+  .slice(0, 8)
+  .map((link) => {
+    const href = normalizeText(link.getAttribute("href") || "");
+    const text = normalizeText(link.textContent || "").slice(0, 80);
+    return `${href}|${text}`;
+  })
+  .join("||");
+
+const waitForSearchResultsReady = async ({
+  expectedSearchText = "",
+  previousSnapshot = "",
+  article = "",
+  timeoutMs = SEARCH_RESULTS_READY_TIMEOUT_MS,
+} = {}) => {
+  const normalizedExpectedSearchText = normalizeText(expectedSearchText);
+
+  return Boolean(await waitForCondition(() => {
+    if (!isListingPage() && !isSearchReadyPage()) {
+      return false;
+    }
+
+    const currentSearchText = getCurrentSearchText();
+
+    if (normalizedExpectedSearchText && currentSearchText !== normalizedExpectedSearchText) {
+      return false;
+    }
+
+    if (article && findMatchingProduct(article)) {
+      return true;
+    }
+
+    const currentSnapshot = getListingSnapshot();
+
+    if (previousSnapshot && currentSnapshot && currentSnapshot !== previousSnapshot) {
+      return true;
+    }
+
+    return !previousSnapshot && currentSnapshot.length > 0;
+  }, timeoutMs, 160));
+};
+
+const normalizeCommandSearchTerms = (command) => {
+  const fromCommand = Array.isArray(command?.searchTerms)
+    ? command.searchTerms.map((value) => String(value || "").trim()).filter(Boolean)
+    : [];
+
+  if (fromCommand.length) {
+    return fromCommand;
+  }
+
+  const fallback = String(command?.searchTerm || command?.brand || "").trim();
+  return fallback ? [fallback] : [];
+};
+
+const buildSearchTermAttemptPlan = (command) => {
+  const searchTerms = normalizeCommandSearchTerms(command);
+  const startIndex = Math.max(
+    0,
+    Math.min(
+      searchTerms.length - 1,
+      Number.parseInt(String(command?.searchTermIndex || 0), 10) || 0,
+    ),
+  );
+
+  if (!searchTerms.length) {
+    return [];
+  }
+
+  const orderedTerms = searchTerms
+    .slice(startIndex)
+    .concat(searchTerms.slice(0, startIndex));
+
+  return orderedTerms.map((term, index) => ({
+    term,
+    retries: index === 0 ? 2 : 1,
+  }));
+};
+
+const submitTermAndWaitUntilReady = async ({ runId, term, article }) => {
+  const normalizedTerm = normalizeText(term);
+  const previousListingSnapshot = getListingSnapshot();
+
+  await submitSearchTerm(term);
+  await sendRuntimeMessage({
+    type: "OZON_SEARCH_SUBMITTED",
+    runId,
+  }).catch(() => {});
+  await waitForSearchResultsReady({
+    expectedSearchText: normalizedTerm,
+    previousSnapshot: previousListingSnapshot,
+    article,
+  });
+};
 
 const findMatchingProduct = (article) => {
   const productLinks = Array.from(document.querySelectorAll(PRODUCT_LINK_SELECTOR));
@@ -1538,7 +2218,7 @@ const scrollForMoreProducts = async () => {
     window.scrollBy(0, Math.max(window.innerHeight * 0.85, 600));
   }
 
-  await delay(60);
+  await delay(280);
 
   return {
     previousScrollY,
@@ -1548,11 +2228,21 @@ const scrollForMoreProducts = async () => {
   };
 };
 
-const waitForMatchingProduct = async (article, timeoutMs = 2200) => {
+const waitForMatchingProduct = async (article, timeoutMs = 8000) => {
   const startedAt = Date.now();
   let noMoreScrollAttempts = 0;
 
+  await resetResultsViewport();
+
   while (Date.now() - startedAt <= timeoutMs) {
+    if (isOzonConnectionErrorPage()) {
+      throw new Error("Ozon page says there is no connection.");
+    }
+
+    if (isPrivacyInterstitialPage()) {
+      throw new Error("Chrome opened a privacy/certificate warning page.");
+    }
+
     const match = findMatchingProduct(article);
 
     if (match) {
@@ -1577,7 +2267,7 @@ const waitForMatchingProduct = async (article, timeoutMs = 2200) => {
       continue;
     }
 
-    await delay(45);
+    await delay(180);
   }
 
   throw new Error(`Артикул ${article} не найден среди текущих результатов.`);
@@ -1619,7 +2309,7 @@ const openProductLinkReliably = async (productLink) => {
 const submitArticleSearch = async (article) => submitSearchTerm(article);
 
 const handleOpenProduct = async (command) => {
-  const actionSignature = `${command.runId}:open:${command.currentCycle}:${window.location.href}:${getCurrentSearchText()}`;
+  const actionSignature = `${command.runId}:open:${command.currentCycle}:${command.searchTerm || ""}:${command.brandFilter || ""}:${window.location.href}:${getCurrentSearchText()}`;
 
   if (lastActionSignature === actionSignature) {
     return;
@@ -1631,28 +2321,126 @@ const handleOpenProduct = async (command) => {
     await delay(command.delayMs);
   }
 
-  const matchingProduct = findMatchingProduct(command.article);
-  const normalizedBrand = normalizeText(command.brand || "");
+  const searchTerm = String(command.searchTerm || command.brand || "").trim();
+  const brandFilter = String(command.brandFilter || "").trim();
+  const brandFilterKey = brandFilter
+    ? `${command.runId}:${command.currentCycle}:${normalizeText(brandFilter).toLowerCase()}`
+    : "";
+  const normalizedSearchTerm = normalizeText(searchTerm);
+  const currentSearchText = getCurrentSearchText();
+  const searchAttemptPlan = buildSearchTermAttemptPlan(command);
 
-  if (!matchingProduct) {
-    const currentSearchText = getCurrentSearchText();
+  if (normalizedSearchTerm && canSearchForArticle() && currentSearchText !== normalizedSearchTerm) {
+    await submitTermAndWaitUntilReady({
+      runId: command.runId,
+      term: searchTerm,
+      article: command.article,
+    });
+  }
 
-    if (normalizedBrand && canSearchForArticle() && currentSearchText !== normalizedBrand) {
-      await submitSearchTerm(command.brand);
-      await delay(40);
-      processRun().catch(() => {});
-      return;
+  if (!normalizedSearchTerm && canSearchForArticle() && getCurrentSearchText() !== normalizeText(command.article)) {
+    await submitTermAndWaitUntilReady({
+      runId: command.runId,
+      term: command.article,
+      article: command.article,
+    });
+  }
+
+  const ensureBrandFilterMetrics = async () => {
+    if (!brandFilter) {
+      return false;
     }
 
-    if (!normalizedBrand && canSearchForArticle() && currentSearchText !== normalizeText(command.article)) {
-      await submitArticleSearch(command.article);
-      await delay(40);
+    const rememberedBrandFilterKey = lastAppliedBrandFilterKey || getStoredAppliedBrandFilterKey();
+
+    if (brandFilterKey && rememberedBrandFilterKey === brandFilterKey) {
+      lastAppliedBrandFilterKey = "";
+      setStoredAppliedBrandFilterKey("");
+      return false;
+    }
+
+    const brandApplied = await ensureBrandFilterApplied(brandFilter);
+
+    if (brandFilterKey) {
+      lastAppliedBrandFilterKey = brandFilterKey;
+      setStoredAppliedBrandFilterKey(brandFilterKey);
+    }
+
+    if (brandApplied) {
+      await sendRuntimeMessage({
+        type: "OZON_BRAND_FILTER_APPLIED",
+        runId: command.runId,
+      }).catch(() => {});
+    }
+
+    return brandApplied;
+  };
+
+  const brandAppliedNow = await ensureBrandFilterMetrics();
+
+  if (brandAppliedNow) {
+    lastActionSignature = "";
+    window.setTimeout(() => {
       processRun().catch(() => {});
-      return;
+    }, 450);
+    return;
+  }
+
+  let match = null;
+  let lastMatchError = null;
+
+  if (searchAttemptPlan.length) {
+    for (let termIndex = 0; termIndex < searchAttemptPlan.length; termIndex += 1) {
+      const attempt = searchAttemptPlan[termIndex];
+      const attemptTerm = String(attempt.term || "").trim();
+      const normalizedAttemptTerm = normalizeText(attemptTerm);
+
+      if (attemptTerm && canSearchForArticle() && getCurrentSearchText() !== normalizedAttemptTerm) {
+        await submitTermAndWaitUntilReady({
+          runId: command.runId,
+          term: attemptTerm,
+          article: command.article,
+        });
+        await ensureBrandFilterMetrics();
+      }
+
+      for (let retryIndex = 0; retryIndex < attempt.retries; retryIndex += 1) {
+        try {
+          match = await waitForMatchingProduct(
+            command.article,
+            termIndex === 0 && retryIndex === 0 ? 8000 : MATCH_RETRY_TIMEOUT_MS,
+          );
+          break;
+        } catch (error) {
+          lastMatchError = error;
+
+          if (retryIndex < attempt.retries - 1 && attemptTerm && canSearchForArticle()) {
+            await submitTermAndWaitUntilReady({
+              runId: command.runId,
+              term: attemptTerm,
+              article: command.article,
+            });
+            await ensureBrandFilterMetrics();
+          }
+        }
+      }
+
+      if (match) {
+        break;
+      }
+    }
+  } else {
+    try {
+      match = await waitForMatchingProduct(command.article);
+    } catch (error) {
+      lastMatchError = error;
     }
   }
 
-  const match = await waitForMatchingProduct(command.article);
+  if (!match) {
+    throw lastMatchError || new Error(`Артикул ${command.article} не найден среди текущих результатов.`);
+  }
+
   const response = await sendRuntimeMessage({
     type: "OZON_PRODUCT_OPENING",
     runId: command.runId,
@@ -1679,6 +2467,8 @@ const handleGoBack = async (command) => {
   }
 
   lastActionSignature = actionSignature;
+  lastAppliedBrandFilterKey = "";
+  setStoredAppliedBrandFilterKey("");
 
   if (command.delayMs) {
     await delay(command.delayMs);
@@ -1700,7 +2490,7 @@ const handleGoBack = async (command) => {
       if (isProductPage()) {
         window.location.assign(command.returnUrl);
       }
-    }, 180);
+    }, 1200);
   }
 };
 
@@ -1938,10 +2728,15 @@ const processRun = async () => {
         pageUrl: window.location.href,
         errorText: "Ozon page says there is no connection.",
       }).catch(() => {});
+      return;
+    }
 
-      window.setTimeout(() => {
-        processRun().catch(() => {});
-      }, 1200);
+    if (isPrivacyInterstitialPage()) {
+      await sendRuntimeMessage({
+        type: "OZON_SKIP_CYCLE",
+        pageUrl: window.location.href,
+        reason: "Chrome opened a privacy/certificate warning page.",
+      }).catch(() => {});
       return;
     }
 
@@ -1991,11 +2786,29 @@ const processRun = async () => {
       await handleGoBack(command);
     }
   } catch (error) {
-    await sendRuntimeMessage({
-      type: "OZON_RUN_FAILED",
-      runId: lastActionSignature.split(":")[0] || "",
-      error: error.message || "Не удалось выполнить шаг цикла.",
-    }).catch(() => {});
+    const errorMessage = error?.message || "Не удалось выполнить шаг цикла.";
+    const normalizedErrorMessage = normalizeText(errorMessage).toLowerCase();
+
+    if (
+      normalizedErrorMessage.includes("не найден среди текущих результатов")
+      || normalizedErrorMessage.includes("there is no connection")
+      || normalizedErrorMessage.includes("privacy/certificate warning")
+      || normalizedErrorMessage.includes("net::err_cert_")
+      || normalizedErrorMessage.includes("net::err_ssl_")
+    ) {
+      lastActionSignature = "";
+      await sendRuntimeMessage({
+        type: "OZON_SKIP_CYCLE",
+        pageUrl: window.location.href,
+        reason: errorMessage,
+      }).catch(() => {});
+    } else {
+      await sendRuntimeMessage({
+        type: "OZON_RUN_FAILED",
+        runId: lastActionSignature.split(":")[0] || "",
+        error: errorMessage,
+      }).catch(() => {});
+    }
   } finally {
     isProcessingRun = false;
   }

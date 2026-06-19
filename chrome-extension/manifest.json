@@ -7,11 +7,15 @@
     "activeTab",
     "storage",
     "tabs",
-    "scripting"
+    "scripting",
+    "proxy",
+    "webRequest",
+    "webRequestAuthProvider"
   ],
   "host_permissions": [
     "*://*.ozon.com/*",
-    "*://*.ozon.ru/*"
+    "*://*.ozon.ru/*",
+    "<all_urls>"
   ],
   "action": {
     "default_title": "Ozon Helper",

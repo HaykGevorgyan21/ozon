@@ -1,7 +1,8 @@
 const activeRuns = new Map();
 const lastRunStates = new Map();
 const DEFAULT_DURATION_MS = 0;
-const GO_BACK_DELAY_MS = 40;
+const GO_BACK_DELAY_MS = 1400;
+const RETURN_PAGE_SETTLE_MS = 1200;
 const LOGIN_TIMEOUT_MS = 2 * 60 * 1000;
 const LOGIN_NAVIGATION_WAIT_MS = 15000;
 const LOGIN_RETRY_WAIT_MS = 2500;
@@ -13,10 +14,19 @@ const PROXY_FAILOVER_COOLDOWN_MS = 100;
 const PROXY_RECOVERY_WATCHDOG_MS = 1200;
 const PROXY_PREFLIGHT_SETTLE_MS = 60;
 const PROXY_PREFLIGHT_TIMEOUT_MS = 650;
+const PROXY_IP_CHECK_TIMEOUT_MS = 900;
+const PROXY_IP_CHANGE_SETTLE_MS = 1800;
+const PROXY_IP_CHANGE_RETRY_DELAY_MS = 1200;
+const PROXY_IP_CHANGE_MAX_ATTEMPTS = 3;
+const SINGLE_PROXY_RECOVERY_ATTEMPTS = 8;
 const PROXY_PREFLIGHT_MIN_WORKING = 1;
 const PROXY_PREFLIGHT_MAX_START_CHECKS = 12;
 const PROXY_PREFLIGHT_MAX_RECOVERY_CHECKS = 18;
 const PROXY_PREFLIGHT_TEST_URLS = ["https://www.ozon.ru/"];
+const PROXY_IP_CHECK_URLS = [
+  "https://api64.ipify.org?format=json",
+  "https://api.ipify.org?format=json",
+];
 const PROXY_FAILOVER_ERRORS = [
   "ERR_PROXY_CONNECTION_FAILED",
   "ERR_SOCKS_CONNECTION_FAILED",
@@ -26,6 +36,17 @@ const PROXY_FAILOVER_ERRORS = [
   "ERR_ADDRESS_UNREACHABLE",
   "ERR_CONNECTION_CLOSED",
   "ERR_CONNECTION_RESET",
+  "ERR_CERT_AUTHORITY_INVALID",
+  "ERR_CERT_COMMON_NAME_INVALID",
+  "ERR_CERT_DATE_INVALID",
+  "ERR_SSL_PROTOCOL_ERROR",
+  "ERR_SSL_VERSION_OR_CIPHER_MISMATCH",
+];
+const ERROR_PAGE_TITLE_FRAGMENTS = [
+  "похоже, нет соединения",
+  "нет соединения",
+  "ошибка нарушения конфиденциальности",
+  "подключение не защищено",
 ];
 let runtimeConfigPromise = null;
 let activeProxyState = null;
@@ -347,6 +368,17 @@ const isLogoutFlowUrl = (url) => {
   }
 };
 
+const getRunElapsedMs = (run, endedAt = Date.now()) => {
+  const startedAt = Number.parseInt(String(run?.startedAt || 0), 10) || 0;
+  const safeEndedAt = Number.parseInt(String(endedAt || Date.now()), 10) || Date.now();
+
+  if (!startedAt) {
+    return 0;
+  }
+
+  return Math.max(0, safeEndedAt - startedAt);
+};
+
 const buildRunSnapshot = (run) => ({
   ok: true,
   running: run.status === "running",
@@ -358,6 +390,7 @@ const buildRunSnapshot = (run) => ({
   listingUrl: run.listingUrl,
   cycles: run.cycles,
   durationMs: run.durationMs,
+  elapsedMs: getRunElapsedMs(run, run.status === "running" ? Date.now() : (run.finishedAt || Date.now())),
   cycleIntervalMs: run.cycleIntervalMs,
   completedCycles: run.completedCycles,
   currentCycle: run.currentCycle,
@@ -365,6 +398,21 @@ const buildRunSnapshot = (run) => ({
   currentAccountIndex: run.currentAccountIndex || 0,
   step: run.step,
   message: run.message,
+  proxyCycleMessage: run.proxyCycleMessage || "",
+  lastKnownProxyIp: run.lastKnownProxyIp || "",
+  proxyBypassedForRun: Boolean(run.proxyBypassedForRun),
+  metrics: {
+    searchSubmissions: run.metrics?.searchSubmissions || 0,
+    brandFilterApplied: run.metrics?.brandFilterApplied || 0,
+    productOpenSignals: run.metrics?.productOpenSignals || 0,
+    productVisits: run.metrics?.productVisits || 0,
+    backNavigations: run.metrics?.backNavigations || 0,
+    proxyRotations: run.metrics?.proxyRotations || 0,
+    proxyRecoveries: run.metrics?.proxyRecoveries || 0,
+    proxyFallbackCycles: run.metrics?.proxyFallbackCycles || 0,
+    failedCycles: run.metrics?.failedCycles || 0,
+    totalProductHoldMs: run.metrics?.totalProductHoldMs || 0,
+  },
 });
 
 const normalizeOptionalUrl = (value) => {
@@ -399,6 +447,11 @@ const buildProxyTestUrl = (baseUrl) => {
   return `${baseUrl}${divider}ozon_proxy_probe=${Date.now()}_${Math.random().toString(16).slice(2)}`;
 };
 
+const buildForcedRunNavigationUrl = (baseUrl) => {
+  const normalizedUrl = normalizeOptionalUrl(baseUrl);
+  return normalizedUrl ? buildProxyTestUrl(normalizedUrl) : "";
+};
+
 const fetchWithTimeout = async (url, timeoutMs) => {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -425,6 +478,130 @@ const isAcceptableProxyResponse = (response) => {
   }
 
   return true;
+};
+
+const parseIpCheckResponse = async (response) => {
+  if (!response || !response.ok) {
+    return "";
+  }
+
+  const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+
+  if (contentType.includes("application/json")) {
+    const payload = await response.json().catch(() => null);
+    const ip = String(payload?.ip || payload?.origin || "").trim();
+    return ip;
+  }
+
+  return String(await response.text().catch(() => "")).trim();
+};
+
+const probeCurrentExitIp = async () => {
+  for (const url of PROXY_IP_CHECK_URLS) {
+    try {
+      const response = await fetchWithTimeout(buildProxyTestUrl(url), PROXY_IP_CHECK_TIMEOUT_MS);
+      const ip = await parseIpCheckResponse(response);
+
+      if (ip) {
+        return ip;
+      }
+    } catch (error) {
+      // Try the next IP check endpoint.
+    }
+  }
+
+  return "";
+};
+
+const probeCurrentExitIpWithRetry = async (previousIp = "") => {
+  const normalizedPreviousIp = String(previousIp || "").trim();
+  let lastIp = "";
+
+  await delay(PROXY_IP_CHANGE_SETTLE_MS);
+
+  for (let attempt = 0; attempt < PROXY_IP_CHANGE_MAX_ATTEMPTS; attempt += 1) {
+    const ip = String(await probeCurrentExitIp().catch(() => "") || "").trim();
+
+    if (ip) {
+      lastIp = ip;
+
+      if (!normalizedPreviousIp || ip !== normalizedPreviousIp) {
+        return ip;
+      }
+    }
+
+    if (attempt < PROXY_IP_CHANGE_MAX_ATTEMPTS - 1) {
+      await delay(PROXY_IP_CHANGE_RETRY_DELAY_MS);
+    }
+  }
+
+  return lastIp;
+};
+
+const buildProxyCycleMessage = ({
+  cycle,
+  requested,
+  label = "",
+  ip = "",
+  changed = null,
+  checked = false,
+  sessionChanged = false,
+}) => {
+  if (!requested) {
+    return `Цикл ${cycle}: запрос к proxy не отправлялся. Proxy не используется.`;
+  }
+
+  const proxyLabel = label ? ` (${label})` : "";
+  const sessionNote = sessionChanged ? " Сессия proxy обновлена." : "";
+
+  if (!checked) {
+    return `Цикл ${cycle}: запрос к proxy отправлен${proxyLabel}.${sessionNote} Проверяю, сменился ли IP...`;
+  }
+
+  if (!ip) {
+    return `Цикл ${cycle}: запрос к proxy отправлен${proxyLabel}.${sessionNote} Проверить IP не удалось.`;
+  }
+
+  if (changed === null) {
+    return `Цикл ${cycle}: запрос к proxy отправлен${proxyLabel}.${sessionNote} Exit IP: ${ip}. Это первая проверка IP.`;
+  }
+
+  return changed
+    ? `Цикл ${cycle}: запрос к proxy отправлен${proxyLabel}.${sessionNote} Exit IP: ${ip}. IP сменился.`
+    : `Цикл ${cycle}: запрос к proxy отправлен${proxyLabel}.${sessionNote} Exit IP: ${ip}. IP не сменился.`;
+};
+
+const buildProxySessionId = (cycleSeed = 0) => (
+  `${Date.now().toString(36)}${Math.max(0, Number.parseInt(String(cycleSeed || 0), 10) || 0)}${Math.random().toString(36).slice(2, 8)}`
+);
+
+const buildProxyBypassMessage = (cycle) => (
+  `Цикл ${cycle}: proxy временно отключен. Продолжаю цикл без proxy.`
+);
+
+const applySessionToProxyUsername = (username, sessionId) => {
+  const normalizedUsername = String(username || "").trim();
+
+  if (!normalizedUsername || !sessionId) {
+    return {
+      username: normalizedUsername,
+      sessionChanged: false,
+    };
+  }
+
+  const knownPattern = /(^|;)(anon|session|sessid|sid)\.[^;]*/i;
+
+  if (knownPattern.test(normalizedUsername)) {
+    return {
+      username: normalizedUsername.replace(knownPattern, `$1$2.${sessionId}`),
+      sessionChanged: true,
+    };
+  }
+
+  return {
+    username: `${normalizedUsername};session.${sessionId}`,
+    sessionChanged: true,
+  };
 };
 
 const loadStoredProxyState = async () => {
@@ -476,7 +653,10 @@ const buildProxyStatusPayload = (proxyState, proxyCount) => {
   };
 };
 
-const applyProxySettings = async (proxy, index, total) => {
+const applyProxySettings = async (proxy, index, total, options = {}) => {
+  const sessionId = String(options.sessionId || "").trim();
+  const sessionRotation = applySessionToProxyUsername(proxy.username, sessionId);
+
   await callChromeApi((done) => {
     chrome.proxy.settings.set({
       value: {
@@ -501,13 +681,19 @@ const applyProxySettings = async (proxy, index, total) => {
     scheme: proxy.scheme,
     host: proxy.host,
     port: proxy.port,
-    username: proxy.username,
+    username: sessionRotation.username,
     password: proxy.password,
     bypassList: proxy.bypassList,
+    sessionId,
+    sessionChanged: sessionRotation.sessionChanged,
   };
 
   await saveProxyState(proxyState);
-  return buildProxyStatusPayload(proxyState, total);
+  return {
+    ...buildProxyStatusPayload(proxyState, total),
+    sessionChanged: sessionRotation.sessionChanged,
+    sessionId,
+  };
 };
 
 const clearProxySettings = async () => {
@@ -517,6 +703,12 @@ const clearProxySettings = async () => {
 
   await clearStoredProxyState();
   return buildProxyStatusPayload(null, 0);
+};
+
+const clearProxySettingsPreservingState = async () => {
+  await callChromeApi((done) => {
+    chrome.proxy.settings.clear({ scope: "regular" }, done);
+  });
 };
 
 const testSingleProxy = async (proxy, index, total) => {
@@ -788,7 +980,9 @@ const rotateProxyFromConfig = async (config, options = {}) => {
   const currentIndex = getStoredProxyIndex(proxies, storedState);
   const nextIndex = (currentIndex + 1) % proxies.length;
 
-  return applyProxySettings(proxies[nextIndex], nextIndex, proxies.length);
+  return applyProxySettings(proxies[nextIndex], nextIndex, proxies.length, {
+    sessionId: options.sessionId,
+  });
 };
 
 const rotateProxyForRun = async (run) => {
@@ -796,29 +990,237 @@ const rotateProxyForRun = async (run) => {
     return null;
   }
 
+  if (run.proxyBypassedForRun) {
+    await clearProxySettings();
+    updateRun(run, {
+      pendingProxyRotation: false,
+      proxyCycleMessage: buildProxyBypassMessage(run.currentCycle),
+      message: "Proxy временно отключен для этого запуска. Циклы продолжаются без proxy.",
+    });
+    return null;
+  }
+
   const config = await loadRuntimeConfig();
-  const proxies = getActiveProxyConfigSummary(config).proxies;
+  const proxies = getProxyConfigSummary(config).proxies;
 
   if (!proxies.length) {
     updateRun(run, {
       pendingProxyRotation: false,
+      proxyCycleMessage: buildProxyCycleMessage({
+        cycle: run.currentCycle,
+        requested: false,
+      }),
     });
     return null;
   }
 
   const proxyStatus = await rotateProxyFromConfig(config, {
     allowUnchecked: true,
+    sessionId: buildProxySessionId(run.currentCycle),
   });
   updateRun(run, {
     pendingProxyRotation: false,
     message: proxyStatus?.message || run.message,
+    metrics: {
+      ...run.metrics,
+      proxyRotations: (run.metrics?.proxyRotations || 0) + 1,
+    },
   });
+
+  const runId = run.runId;
+  const cycle = run.currentCycle;
+  const previousIp = String(run.lastKnownProxyIp || "").trim();
+  const tabId = run.tabId;
+
+  probeCurrentExitIpWithRetry(previousIp)
+    .then((ip) => {
+      const currentRun = activeRuns.get(tabId);
+
+      if (!currentRun || currentRun.runId !== runId || currentRun.currentCycle !== cycle) {
+        return;
+      }
+
+      const normalizedIp = String(ip || "").trim();
+      const didChange = previousIp
+        ? normalizedIp
+          ? normalizedIp !== previousIp
+          : null
+        : null;
+
+      updateRun(currentRun, {
+        lastKnownProxyIp: normalizedIp || currentRun.lastKnownProxyIp || "",
+        proxyCycleMessage: buildProxyCycleMessage({
+          cycle,
+          requested: true,
+          label: proxyStatus?.label || "",
+          ip: normalizedIp,
+          changed: didChange,
+          checked: true,
+          sessionChanged: Boolean(proxyStatus?.sessionChanged),
+        }),
+      });
+    })
+    .catch(() => {
+      const currentRun = activeRuns.get(tabId);
+
+      if (!currentRun || currentRun.runId !== runId || currentRun.currentCycle !== cycle) {
+        return;
+      }
+
+      updateRun(currentRun, {
+        proxyCycleMessage: buildProxyCycleMessage({
+          cycle,
+          requested: true,
+          label: proxyStatus?.label || "",
+          ip: "",
+          changed: null,
+          checked: true,
+          sessionChanged: Boolean(proxyStatus?.sessionChanged),
+        }),
+      });
+    });
+
   return proxyStatus;
+};
+
+const continueRunWithoutProxy = async (run, retryUrl, reason = "") => {
+  const forcedRetryUrl = buildForcedRunNavigationUrl(retryUrl) || normalizeOptionalUrl(retryUrl);
+
+  await clearProxySettingsPreservingState();
+
+  updateRun(run, {
+    proxyFailureCount: 0,
+    pendingProxyRotation: false,
+    proxyRecoveryInFlight: false,
+    proxyBypassedForRun: true,
+    lastRequestedUrl: forcedRetryUrl,
+    step: "Proxy отключен только для текущего цикла, продолжаю без него...",
+    message: reason || "Proxy нестабилен в этом цикле, поэтому продолжаю его без proxy.",
+    proxyCycleMessage: buildProxyBypassMessage(run.currentCycle),
+    metrics: {
+      ...run.metrics,
+      proxyFallbackCycles: (run.metrics?.proxyFallbackCycles || 0) + 1,
+    },
+  });
+
+  await chrome.tabs.update(run.tabId, { url: forcedRetryUrl });
+};
+
+const getResumeUrlForRun = (run) => {
+  const candidates = [
+    normalizeOptionalUrl(run?.listingUrl),
+    normalizeOptionalUrl(run?.startUrl),
+    normalizeOptionalUrl(run?.lastRequestedUrl),
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    if (isOzonResultsUrl(candidate)) {
+      return candidate;
+    }
+  }
+
+  for (const candidate of candidates) {
+    if (isOzonTab(candidate)) {
+      try {
+        const parsedUrl = new URL(candidate);
+        return `${parsedUrl.origin}/`;
+      } catch (error) {
+        return candidate;
+      }
+    }
+  }
+
+  return PROXY_PREFLIGHT_TEST_URLS[0];
+};
+
+const skipCurrentCycleAfterConnectionError = async (run, reason = "") => {
+  if (!run || run.cycleSkipInFlight) {
+    return;
+  }
+
+  updateRun(run, {
+    cycleSkipInFlight: true,
+  });
+  clearProxyRecoveryWatchdog(run);
+
+  const skippedCycle = Math.max(
+    1,
+    Number.parseInt(String(run.currentCycle || (run.completedCycles || 0) + 1), 10) || 1,
+  );
+  const completedCycles = Math.max(run.completedCycles || 0, skippedCycle);
+  const nextCycle = completedCycles + 1;
+  const resumeUrl = getResumeUrlForRun(run);
+  const forcedResumeUrl = buildForcedRunNavigationUrl(resumeUrl) || resumeUrl;
+  const nextSearchTerm = getCycleSearchTerm(run, nextCycle);
+  const nextStep = nextSearchTerm
+    ? `Ищу товар по запросу "${nextSearchTerm}": цикл ${nextCycle} из ${run.cycles}.`
+    : `Ищу товар: цикл ${nextCycle} из ${run.cycles}.`;
+  const failureMessage = reason || "Ozon открыл страницу без соединения, поэтому пропускаю текущий цикл.";
+
+  updateRun(run, {
+    completedCycles,
+    currentCycle: Math.min(nextCycle, run.cycles),
+    currentSearchTerm: nextSearchTerm,
+    phase: "search",
+    nextCycleDelayMs: 0,
+    pendingProxyRotation: completedCycles < run.cycles,
+    proxyFailureCount: 0,
+    lastProxyFailureAt: 0,
+    proxyRecoveryInFlight: false,
+    proxyBypassedForRun: false,
+    lastRequestedUrl: forcedResumeUrl,
+    step: completedCycles < run.cycles
+      ? `Пропускаю цикл ${skippedCycle} после ошибки страницы. Перехожу к следующему.`
+      : `Пропускаю цикл ${skippedCycle} после ошибки страницы и завершаю запуск.`,
+    message: completedCycles < run.cycles
+      ? `${failureMessage} Выполнено ${completedCycles} из ${run.cycles}.`
+      : `${failureMessage} Это был последний цикл.`,
+    proxyCycleMessage: `Цикл ${skippedCycle}: страница Ozon не открылась. Пропускаю этот цикл.`,
+    metrics: {
+      ...run.metrics,
+      failedCycles: (run.metrics?.failedCycles || 0) + 1,
+    },
+  });
+
+  try {
+    await clearProxySettingsPreservingState();
+  } catch (error) {
+    // Ignore proxy cleanup failures so the run can still advance.
+  }
+
+  if (completedCycles >= run.cycles) {
+    finishRun(
+      run,
+      "completed",
+      `Готово. Выполнено ${run.cycles} циклов за ${formatDuration(getRunElapsedMs(run))}. Последний цикл пропущен из-за ошибки соединения.`,
+    );
+    return;
+  }
+
+  updateRun(run, {
+    cycleSkipInFlight: false,
+    step: nextStep,
+    message: `Выполнено ${completedCycles} из ${run.cycles}. Цикл ${skippedCycle} пропущен из-за ошибки соединения.`,
+  });
+
+  await chrome.tabs.update(run.tabId, { url: forcedResumeUrl });
 };
 
 const isRetryableProxyError = (errorText) => {
   const normalizedError = String(errorText || "").toUpperCase();
   return PROXY_FAILOVER_ERRORS.some((code) => normalizedError.includes(code));
+};
+
+const isSkippableProxyError = (errorText) => {
+  const normalizedError = String(errorText || "").toUpperCase();
+  return [
+    "ERR_CERT_AUTHORITY_INVALID",
+    "ERR_CERT_COMMON_NAME_INVALID",
+    "ERR_CERT_DATE_INVALID",
+    "ERR_SSL_PROTOCOL_ERROR",
+    "ERR_SSL_VERSION_OR_CIPHER_MISMATCH",
+    "PRIVACY/ERROR PAGE",
+  ].some((code) => normalizedError.includes(code));
 };
 
 const getRetryUrlForRun = (run, failedUrl = "") => {
@@ -842,7 +1244,31 @@ const getRetryUrlForRun = (run, failedUrl = "") => {
   return "";
 };
 
+const shouldRecoverNativeErrorPage = (run, tabUrl = "", pendingUrl = "") => {
+  const candidates = [
+    String(tabUrl || "").trim(),
+    String(pendingUrl || "").trim(),
+    String(run?.lastRequestedUrl || "").trim(),
+    String(run?.lastProductUrl || "").trim(),
+    String(run?.listingUrl || "").trim(),
+    String(run?.startUrl || "").trim(),
+  ].filter(Boolean);
+
+  return candidates.some((value) => isOzonTab(value));
+};
+
+const isKnownBrokenPageTitle = (title = "") => {
+  const normalizedTitle = String(title || "").trim().toLowerCase();
+
+  if (!normalizedTitle) {
+    return false;
+  }
+
+  return ERROR_PAGE_TITLE_FRAGMENTS.some((fragment) => normalizedTitle.includes(fragment));
+};
+
 const getProxyStatus = async (config) => {
+  const fullSummary = getProxyConfigSummary(config);
   const {
     proxies,
     error,
@@ -888,16 +1314,17 @@ const getProxyStatus = async (config) => {
   }
 
   const clampedIndex = Math.min(Math.max(storedState.index || 0, 0), proxies.length - 1);
-  const proxy = proxies[clampedIndex];
+  const fullIndex = Math.max(getStoredProxyIndex(fullSummary.proxies, storedState), 0);
+  const proxy = fullSummary.proxies[fullIndex] || proxies[clampedIndex];
 
   const statusPayload = buildProxyStatusPayload({
     ...storedState,
-    index: clampedIndex,
+    index: fullIndex,
     label: proxy.label,
     scheme: proxy.scheme,
     host: proxy.host,
     port: proxy.port,
-  }, proxies.length);
+  }, fullSummary.proxies.length || proxies.length);
 
   if (prepared) {
     statusPayload.message = uncheckedCount > 0
@@ -926,7 +1353,10 @@ const loadRuntimeConfig = async () => {
       const parsedConfig = await response.json();
       return parsedConfig && typeof parsedConfig === "object" ? parsedConfig : {};
     })
-    .catch(() => ({}));
+    .catch(() => ({}))
+    .finally(() => {
+      runtimeConfigPromise = null;
+    });
 
   return runtimeConfigPromise;
 };
@@ -1014,15 +1444,64 @@ const parseDurationMs = (value) => {
 
 const calculateCycleIntervalMs = (durationMs, cycles) => Math.max(0, Math.floor(durationMs / cycles));
 
+const normalizeSearchTerms = (values) => (
+  Array.isArray(values)
+    ? values.map((value) => String(value || "").trim()).filter(Boolean)
+    : []
+);
+
+const getCycleSearchTerm = (run, cycleNumber = 1) => {
+  const searchTerms = normalizeSearchTerms(run?.searchTerms);
+
+  if (!searchTerms.length) {
+    return String(run?.brand || "").trim();
+  }
+
+  const safeCycleNumber = Math.max(1, Number.parseInt(String(cycleNumber || 1), 10) || 1);
+  return searchTerms[(safeCycleNumber - 1) % searchTerms.length] || "";
+};
+
+const getCycleSearchTermIndex = (run, cycleNumber = 1) => {
+  const searchTerms = normalizeSearchTerms(run?.searchTerms);
+
+  if (!searchTerms.length) {
+    return 0;
+  }
+
+  const safeCycleNumber = Math.max(1, Number.parseInt(String(cycleNumber || 1), 10) || 1);
+  return (safeCycleNumber - 1) % searchTerms.length;
+};
+
+const createRunMetrics = () => ({
+  searchSubmissions: 0,
+  brandFilterApplied: 0,
+  productOpenSignals: 0,
+  productVisits: 0,
+  backNavigations: 0,
+  proxyRotations: 0,
+  proxyRecoveries: 0,
+  proxyFallbackCycles: 0,
+  failedCycles: 0,
+  totalProductHoldMs: 0,
+});
+
 const buildSearchPhaseCommand = (run, pageUrl, delayMs = 0) => {
+  const nextCycle = run.completedCycles + 1;
+  const searchTerm = getCycleSearchTerm(run, nextCycle);
+  const searchTermIndex = getCycleSearchTermIndex(run, nextCycle);
+
   updateRun(run, {
-    currentCycle: run.completedCycles + 1,
+    cycleSkipInFlight: false,
+    currentCycle: nextCycle,
+    currentSearchTerm: searchTerm,
     listingUrl: pageUrl || run.listingUrl,
     pendingProxyRotation: false,
     phase: "opening",
     step: delayMs > 0
-      ? `Жду ${formatDuration(delayMs)} перед циклом ${run.completedCycles + 1} из ${run.cycles}.`
-      : `Ищу товар: цикл ${run.completedCycles + 1} из ${run.cycles}.`,
+      ? `Жду ${formatDuration(delayMs)} перед циклом ${nextCycle} из ${run.cycles}.`
+      : searchTerm
+        ? `Ищу товар по запросу "${searchTerm}": цикл ${nextCycle} из ${run.cycles}.`
+        : `Ищу товар: цикл ${nextCycle} из ${run.cycles}.`,
     message: `Выполнено ${run.completedCycles} из ${run.cycles}.`,
   });
 
@@ -1031,6 +1510,10 @@ const buildSearchPhaseCommand = (run, pageUrl, delayMs = 0) => {
     action: "openProduct",
     runId: run.runId,
     brand: run.brand,
+    brandFilter: run.brandFilter,
+    searchTerm,
+    searchTermIndex,
+    searchTerms: normalizeSearchTerms(run.searchTerms),
     article: run.article,
     currentCycle: run.currentCycle,
     cycles: run.cycles,
@@ -1154,10 +1637,16 @@ const clearProxyIfNoActiveRuns = async () => {
 
 const finishRun = (run, status, message) => {
   clearProxyRecoveryWatchdog(run);
+  const finishedAt = Date.now();
   updateRun(run, {
     status,
+    finishedAt,
     step: message,
     message,
+    metrics: {
+      ...run.metrics,
+      failedCycles: (run.metrics?.failedCycles || 0) + (status === "error" ? 1 : 0),
+    },
   });
 
   activeRuns.delete(run.tabId);
@@ -1237,7 +1726,7 @@ const wakeTab = async (tabId) => {
   }
 };
 
-const startRun = async (_loginUrl, _phones, brand, article, cycles, durationMs) => {
+const startRun = async (_loginUrl, _phones, searchTermsInput, brandFilterInput, article, cycles, durationMs) => {
   const tab = await getStartTab();
 
   if (!tab?.id) {
@@ -1246,6 +1735,9 @@ const startRun = async (_loginUrl, _phones, brand, article, cycles, durationMs) 
 
   const loginEnabled = false;
   const effectiveCycles = cycles;
+  const searchTerms = normalizeSearchTerms(searchTermsInput);
+  const primarySearchTerm = searchTerms[0] || "";
+  const brandFilter = String(brandFilterInput || "").trim();
 
   cancelRunByTabId(tab.id, "Предыдущий запуск заменен новым.");
 
@@ -1266,8 +1758,12 @@ const startRun = async (_loginUrl, _phones, brand, article, cycles, durationMs) 
     loginSubmitAttempts: 0,
     logoutStartedAt: 0,
     logoutAttempts: 0,
-    brand,
+    brand: primarySearchTerm,
+    brandFilter,
+    searchTerms,
     article,
+    startedAt: Date.now(),
+    finishedAt: 0,
     startUrl: tab.url || "",
     listingUrl: tab.url || "",
     cycles: effectiveCycles,
@@ -1279,7 +1775,10 @@ const startRun = async (_loginUrl, _phones, brand, article, cycles, durationMs) 
     pendingProxyRotation: true,
     phase: "search",
     status: "running",
-    step: `Ищу товар: цикл 1 из ${effectiveCycles}.`,
+    currentSearchTerm: getCycleSearchTerm({ brand: primarySearchTerm, searchTerms }, 1),
+    step: primarySearchTerm
+      ? `Ищу товар по запросу "${primarySearchTerm}": цикл 1 из ${effectiveCycles}.`
+      : `Ищу товар: цикл 1 из ${effectiveCycles}.`,
     message: `Выполнено 0 из ${effectiveCycles}. Интервал между циклами: ${formatDuration(calculateCycleIntervalMs(durationMs, effectiveCycles))}.`,
     lastRequestedUrl: tab.url || "",
     lastProductUrl: "",
@@ -1287,6 +1786,12 @@ const startRun = async (_loginUrl, _phones, brand, article, cycles, durationMs) 
     lastProxyFailureAt: 0,
     proxyRecoveryInFlight: false,
     proxyRecoveryWatchdogId: 0,
+    cycleSkipInFlight: false,
+    proxyCycleMessage: "",
+    lastKnownProxyIp: "",
+    proxyBypassedForRun: false,
+    productPageEnteredAt: 0,
+    metrics: createRunMetrics(),
   };
 
   activeRuns.set(tab.id, run);
@@ -1298,9 +1803,11 @@ const startRun = async (_loginUrl, _phones, brand, article, cycles, durationMs) 
   return {
     ok: true,
     running: true,
-    message: brand
-      ? `Запущено ${effectiveCycles} цикл(ов) для бренда ${brand} и артикула ${article} на ${formatDuration(durationMs)}.`
-      : `Запущено ${effectiveCycles} цикл(ов) для артикула ${article} на ${formatDuration(durationMs)}.`,
+    message: searchTerms.length > 1
+      ? `Запущено ${effectiveCycles} цикл(ов) для артикула ${article} с ${searchTerms.length} поисковыми названиями по очереди${brandFilter ? ` и брендом "${brandFilter}"` : ""}.`
+      : primarySearchTerm
+        ? `Запущено ${effectiveCycles} цикл(ов) для запроса "${primarySearchTerm}" и артикула ${article}${brandFilter ? ` с брендом "${brandFilter}"` : ""} на ${formatDuration(durationMs)}.`
+        : `Запущено ${effectiveCycles} цикл(ов) для артикула ${article}${brandFilter ? ` с брендом "${brandFilter}"` : ""} на ${formatDuration(durationMs)}.`,
   };
 };
 
@@ -1409,11 +1916,9 @@ const recoverRunAfterProxyFailure = async (tabId, failedUrl, errorText) => {
     }
 
     const nextFailureCount = (run.proxyFailureCount || 0) + 1;
-    const maxRecoveryAttempts = Math.max(proxies.length * 2, 3);
-
-    if (nextFailureCount > maxRecoveryAttempts) {
-      throw new Error("Не удалось найти рабочий proxy. Расширение перебрало слишком много вариантов.");
-    }
+    const maxRecoveryAttempts = proxies.length <= 1
+      ? SINGLE_PROXY_RECOVERY_ATTEMPTS
+      : Math.max(proxies.length * 2, 3);
 
     const retryUrl = getRetryUrlForRun(run, failedUrl);
 
@@ -1421,14 +1926,24 @@ const recoverRunAfterProxyFailure = async (tabId, failedUrl, errorText) => {
       throw new Error("Не удалось определить адрес для повторной попытки после смены proxy.");
     }
 
+    if (nextFailureCount > maxRecoveryAttempts) {
+      await continueRunWithoutProxy(
+        run,
+        retryUrl,
+        "Proxy слишком часто срывает загрузку, поэтому продолжаю текущий запуск без proxy.",
+      );
+      return;
+    }
+
     const failedProxyState = await loadStoredProxyState();
 
-    if (failedProxyState) {
+    if (failedProxyState && proxies.length > 1) {
       removeProxyFromPreparedPool(failedProxyState);
     }
 
     const proxyStatus = await rotateProxyFromConfig(config, {
       allowUnchecked: true,
+      sessionId: buildProxySessionId(`${run.currentCycle}-retry-${nextFailureCount}`),
     });
 
     updateRun(run, {
@@ -1438,11 +1953,26 @@ const recoverRunAfterProxyFailure = async (tabId, failedUrl, errorText) => {
       lastRequestedUrl: retryUrl,
       step: `Proxy упал, переключаюсь и повторяю попытку ${nextFailureCount}...`,
       message: proxyStatus?.message || "Proxy переключен. Повторяю открытие страницы.",
+      metrics: {
+        ...run.metrics,
+        proxyRecoveries: (run.metrics?.proxyRecoveries || 0) + 1,
+      },
     });
 
     scheduleProxyRecoveryWatchdog(run, retryUrl);
-    await chrome.tabs.update(tabId, { url: retryUrl });
+    await chrome.tabs.update(tabId, { url: buildForcedRunNavigationUrl(retryUrl) || retryUrl });
   } catch (error) {
+    const retryUrl = getRetryUrlForRun(run, failedUrl);
+
+    if (retryUrl) {
+      await continueRunWithoutProxy(
+        run,
+        retryUrl,
+        error.message || "Не удалось быстро переключить proxy после ошибки соединения. Продолжаю без proxy.",
+      );
+      return;
+    }
+
     finishRun(
       run,
       "error",
@@ -1701,6 +2231,18 @@ const getRunCommand = async (tabId, pageType, pageUrl, loginState = "other") => 
   }
 
   if (pageType === "product") {
+    const hasRecordedProductVisit = run.phase === "product" && run.productPageEnteredAt;
+
+    if (!hasRecordedProductVisit) {
+      updateRun(run, {
+        productPageEnteredAt: Date.now(),
+        metrics: {
+          ...run.metrics,
+          productVisits: (run.metrics?.productVisits || 0) + 1,
+        },
+      });
+    }
+
     if (run.logoutAfterRun) {
         updateRun(run, {
           completedCycles: Math.max(run.completedCycles, run.currentCycle),
@@ -1760,7 +2302,11 @@ const getRunCommand = async (tabId, pageType, pageUrl, loginState = "other") => 
         };
       }
 
-      finishRun(run, "completed", `Готово. Выполнено ${run.cycles} циклов за ${formatDuration(run.durationMs)}.`);
+      finishRun(
+        run,
+        "completed",
+        `Готово. Выполнено ${run.cycles} циклов за ${formatDuration(getRunElapsedMs(run))}.`,
+      );
       return {
         ok: true,
         action: "finish",
@@ -1773,6 +2319,8 @@ const getRunCommand = async (tabId, pageType, pageUrl, loginState = "other") => 
       pendingProxyRotation: true,
       phase: "search",
       nextCycleDelayMs: 0,
+      proxyFailureCount: 0,
+      proxyBypassedForRun: false,
       step: `Ищу товар: цикл ${completedCycles + 1} из ${run.cycles}.`,
       message: `Выполнено ${completedCycles} из ${run.cycles}.`,
     });
@@ -1787,7 +2335,7 @@ const getRunCommand = async (tabId, pageType, pageUrl, loginState = "other") => 
       };
     }
 
-    return buildSearchPhaseCommand(run, pageUrl, 0);
+    return buildSearchPhaseCommand(run, pageUrl, RETURN_PAGE_SETTLE_MS);
   }
 
   return {
@@ -1815,6 +2363,10 @@ const markProductOpening = (tabId, runId, productUrl) => {
     lastProductUrl: productUrl,
     lastRequestedUrl: productUrl,
     nextCycleDelayMs: 0,
+    metrics: {
+      ...run.metrics,
+      productOpenSignals: (run.metrics?.productOpenSignals || 0) + 1,
+    },
   });
 
   return {
@@ -1858,6 +2410,59 @@ const markGoingBack = (tabId, runId) => {
     phase: "returning",
     step: `Возвращаюсь назад: цикл ${run.currentCycle} из ${run.cycles}.`,
     message: `Выполнено ${run.completedCycles} из ${run.cycles}.`,
+    metrics: {
+      ...run.metrics,
+      backNavigations: (run.metrics?.backNavigations || 0) + 1,
+      totalProductHoldMs: (run.metrics?.totalProductHoldMs || 0) + Math.max(
+        0,
+        Date.now() - (run.productPageEnteredAt || Date.now()),
+      ),
+    },
+    productPageEnteredAt: 0,
+  });
+
+  return {
+    ok: true,
+  };
+};
+
+const markSearchSubmitted = (tabId, runId) => {
+  const run = activeRuns.get(tabId);
+
+  if (!run || run.runId !== runId) {
+    return {
+      ok: false,
+      error: "Запуск уже неактивен.",
+    };
+  }
+
+  updateRun(run, {
+    metrics: {
+      ...run.metrics,
+      searchSubmissions: (run.metrics?.searchSubmissions || 0) + 1,
+    },
+  });
+
+  return {
+    ok: true,
+  };
+};
+
+const markBrandFilterApplied = (tabId, runId) => {
+  const run = activeRuns.get(tabId);
+
+  if (!run || run.runId !== runId) {
+    return {
+      ok: false,
+      error: "Запуск уже неактивен.",
+    };
+  }
+
+  updateRun(run, {
+    metrics: {
+      ...run.metrics,
+      brandFilterApplied: (run.metrics?.brandFilterApplied || 0) + 1,
+    },
   });
 
   return {
@@ -1892,6 +2497,7 @@ const navigateRunTab = async (tabId, runId, nextUrl) => {
   }
 
   const normalizedUrl = normalizeOptionalUrl(nextUrl);
+  const forcedUrl = buildForcedRunNavigationUrl(normalizedUrl) || normalizedUrl;
 
   if (!normalizedUrl || !isOzonTab(normalizedUrl)) {
     return {
@@ -1901,10 +2507,10 @@ const navigateRunTab = async (tabId, runId, nextUrl) => {
   }
 
   updateRun(run, {
-    lastRequestedUrl: normalizedUrl,
+    lastRequestedUrl: forcedUrl,
   });
 
-  await chrome.tabs.update(tabId, { url: normalizedUrl });
+  await chrome.tabs.update(tabId, { url: forcedUrl });
 
   return {
     ok: true,
@@ -1922,6 +2528,8 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   }
 
   const tabUrl = String(changeInfo.url || tab?.url || "");
+  const pendingUrl = String(tab?.pendingUrl || "");
+  const tabTitle = String(tab?.title || "");
   const run = activeRuns.get(tabId);
 
   if (!run) {
@@ -1946,13 +2554,20 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 
   Promise.resolve()
     .then(async () => {
+      if (isKnownBrokenPageTitle(tabTitle) && shouldRecoverNativeErrorPage(run, tabUrl, pendingUrl)) {
+        await skipCurrentCycleAfterConnectionError(
+          run,
+          `Обнаружена страница ошибки "${tabTitle}". Пропускаю текущий цикл и перехожу к следующему proxy.`,
+        );
+        return;
+      }
+
       const wokeUp = await wakeTab(tabId);
 
-      if (!wokeUp && isOzonTab(tabUrl)) {
-        await recoverRunAfterProxyFailure(
-          tabId,
-          tabUrl,
-          "Loaded native browser error page after proxy switch.",
+      if (!wokeUp && shouldRecoverNativeErrorPage(run, tabUrl, pendingUrl)) {
+        await skipCurrentCycleAfterConnectionError(
+          run,
+          "Chrome открыл страницу ошибки конфиденциальности. Пропускаю текущий цикл и перехожу к следующему proxy.",
         );
         return;
       }
@@ -1979,6 +2594,14 @@ chrome.webRequest.onErrorOccurred.addListener((details) => {
     return;
   }
 
+  if (isSkippableProxyError(details.error)) {
+    skipCurrentCycleAfterConnectionError(
+      run,
+      `Chrome получил ${details.error}. Пропускаю текущий цикл и перехожу к следующему proxy.`,
+    ).catch(() => {});
+    return;
+  }
+
   recoverRunAfterProxyFailure(details.tabId, details.url, details.error).catch(() => {});
 }, { urls: ["<all_urls>"] });
 
@@ -1987,6 +2610,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     loadRuntimeConfig()
       .then((config) => {
         const brand = String(message.brand || "").trim();
+        const searchTerms = normalizeSearchTerms(message.searchTerms);
+        const brandFilter = String(message.brandFilter || "").trim();
         const article = String(message.article || "").trim();
         const cycles = Math.max(1, Number.parseInt(String(message.cycles || "1"), 10) || 1);
         const durationMs = parseDurationMs(message.durationMs);
@@ -2010,7 +2635,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
         clearStartupPreparationState();
 
-        startRun("", [], brand, article, cycles, durationMs)
+        startRun("", [], searchTerms.length ? searchTerms : [brand], brandFilter, article, cycles, durationMs)
           .then((result) => {
             clearStartupPreparationState();
             sendResponse(result);
@@ -2050,7 +2675,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message?.type === "ROTATE_OZON_PROXY") {
     loadRuntimeConfig()
-      .then((config) => rotateProxyFromConfig(config))
+      .then((config) => rotateProxyFromConfig(config, {
+        sessionId: buildProxySessionId("manual"),
+      }))
       .then(sendResponse)
       .catch((error) => {
         sendResponse({
@@ -2091,21 +2718,69 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return false;
     }
 
-    recoverRunAfterProxyFailure(
-      tabId,
-      String(message.pageUrl || sender.tab?.url || ""),
-      String(message.errorText || "Ozon page reported no connection"),
-    )
+    Promise.resolve()
+      .then(async () => {
+        const run = activeRuns.get(tabId);
+
+        if (!run) {
+          throw new Error("Запуск уже неактивен.");
+        }
+
+        await skipCurrentCycleAfterConnectionError(
+          run,
+          String(message.errorText || "Ozon page reported no connection"),
+        );
+      })
       .then(() => {
         sendResponse({
           ok: true,
-          message: "Proxy ошибка на странице замечена. Переключаюсь на следующий proxy.",
+          message: "Страница без соединения замечена. Пропускаю текущий цикл и перехожу к следующему.",
         });
       })
       .catch((error) => {
         sendResponse({
           ok: false,
-          message: error.message || "Не удалось переключить proxy после ошибки страницы.",
+          message: error.message || "Не удалось пропустить цикл после ошибки страницы.",
+        });
+      });
+
+    return true;
+  }
+
+  if (message?.type === "OZON_SKIP_CYCLE") {
+    const tabId = sender.tab?.id;
+
+    if (!tabId) {
+      sendResponse({
+        ok: false,
+        message: "Не удалось определить вкладку для пропуска цикла.",
+      });
+      return false;
+    }
+
+    Promise.resolve()
+      .then(async () => {
+        const run = activeRuns.get(tabId);
+
+        if (!run) {
+          throw new Error("Запуск уже неактивен.");
+        }
+
+        await skipCurrentCycleAfterConnectionError(
+          run,
+          String(message.reason || "Текущий цикл пропущен из-за ошибки страницы."),
+        );
+      })
+      .then(() => {
+        sendResponse({
+          ok: true,
+          message: "Текущий цикл пропущен. Перехожу к следующему proxy.",
+        });
+      })
+      .catch((error) => {
+        sendResponse({
+          ok: false,
+          message: error.message || "Не удалось пропустить цикл.",
         });
       });
 
@@ -2199,6 +2874,36 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     sendResponse(markLoginSubmitted(tabId, message.runId));
+    return false;
+  }
+
+  if (message?.type === "OZON_SEARCH_SUBMITTED") {
+    const tabId = sender.tab?.id;
+
+    if (!tabId) {
+      sendResponse({
+        ok: false,
+        error: "Не удалось определить вкладку.",
+      });
+      return false;
+    }
+
+    sendResponse(markSearchSubmitted(tabId, message.runId));
+    return false;
+  }
+
+  if (message?.type === "OZON_BRAND_FILTER_APPLIED") {
+    const tabId = sender.tab?.id;
+
+    if (!tabId) {
+      sendResponse({
+        ok: false,
+        error: "Не удалось определить вкладку.",
+      });
+      return false;
+    }
+
+    sendResponse(markBrandFilterApplied(tabId, message.runId));
     return false;
   }
 

@@ -11,18 +11,34 @@
     <p class="eyebrow">WebNavigator Extension</p>
     <h1>Ozon Helper</h1>
     <p class="copy">
-      Откройте страницу результатов поиска Ozon, при желании укажите бренд, затем введите артикул и дайте расширению найти нужный товар в текущей вкладке.
+      Откройте страницу результатов поиска Ozon, добавьте одно или несколько поисковых названий товара, затем введите артикул и дайте расширению найти нужный товар в текущей вкладке.
     </p>
 
     <form id="find-form" class="find-form">
-      <label for="brand-input">Бренд товара</label>
-      <input
-        id="brand-input"
-        name="brand"
-        type="text"
-        placeholder="Например Apple или Xiaomi"
-        autocomplete="off"
-      >
+      <div class="field-header">
+        <label for="brand-input">Поисковые названия товара</label>
+        <button
+          id="add-search-term-button"
+          type="button"
+          class="field-action-button"
+          aria-label="Добавить еще одно название товара"
+        >+</button>
+      </div>
+      <div id="search-term-list" class="search-term-list">
+        <div class="search-term-row">
+          <input
+            id="brand-input"
+            name="brand"
+            type="text"
+            class="search-term-input"
+            placeholder="Например Power Bank 30000mAh"
+            autocomplete="off"
+          >
+        </div>
+      </div>
+      <p class="field-hint">
+        Добавьте несколько названий одного товара. Каждый цикл будет использовать следующее название по очереди.
+      </p>
       <label for="article-input">Артикул товара</label>
       <input
         id="article-input"
@@ -43,30 +59,11 @@
         inputmode="numeric"
         required
       >
-      <label for="duration-input">За какое время выполнить циклы</label>
-      <select id="duration-input" name="duration" required>
-        <option value="1800000">30 минут</option>
-        <option value="3600000">1:00</option>
-        <option value="5400000">1:30</option>
-        <option value="7200000">2:00</option>
-        <option value="9000000">2:30</option>
-        <option value="10800000">3:00</option>
-        <option value="12600000">3:30</option>
-        <option value="14400000">4:00</option>
-        <option value="16200000">4:30</option>
-        <option value="18000000">5:00</option>
-        <option value="19800000">5:30</option>
-        <option value="21600000">6:00</option>
-        <option value="23400000">6:30</option>
-        <option value="25200000">7:00</option>
-        <option value="27000000">7:30</option>
-        <option value="28800000">8:00</option>
-        <option value="30600000">8:30</option>
-        <option value="32400000">9:00</option>
-        <option value="34200000">9:30</option>
-        <option value="36000000">10:00</option>
-      </select>
-      <p id="schedule-summary" class="schedule-summary" aria-live="polite"></p>
+      <div class="proxy-tools">
+        <button id="next-proxy-button" type="button" class="secondary-button">Сменить proxy</button>
+        <button id="disable-proxy-button" type="button" class="secondary-button danger-button">Отключить proxy</button>
+      </div>
+      <p id="proxy-message" class="proxy-message" aria-live="polite"></p>
       <div class="actions">
         <button id="start-button" type="submit">Запустить циклы</button>
         <button id="stop-button" type="button" class="secondary-button">Стоп</button>
@@ -74,6 +71,7 @@
     </form>
 
     <p id="progress-message" class="progress-message" aria-live="polite"></p>
+    <p id="metrics-message" class="metrics-message" aria-live="polite"></p>
     <p id="status-message" class="status-message" aria-live="polite">Готово к поиску.</p>
   </main>
 
